@@ -24,9 +24,11 @@
 //  silent — the UI doesn't need to disable the per-eye fine sliders
 //  when their effect would push past the limit.
 //
-//  Slice scope: convergence, per-eye fine, reset, nudge, crop toggle.
-//  Preview-mode (SbS / anaglyph / channel-test) and swap-eyes live in
-//  this same model in later slices — extending here is intentional.
+//  Slice #6 scope: convergence, per-eye fine, reset, nudge.
+//  Slice #7 scope: crop toggle (auto/off).
+//  Slice #8 scope: iPad screen-mode (sbs/anaglyph/channel-test) and
+//  swap-eyes — these only affect the on-screen preview pipeline; the
+//  NDI-output pipeline always renders SbS regardless.
 
 import Foundation
 import Observation
@@ -48,6 +50,25 @@ import Observation
 enum CropMode: String, CaseIterable, Sendable {
     case auto
     case off
+}
+
+/// What the iPad preview screen renders. Only affects the screen
+/// pipeline — `StereoCompositor.renderForSender(...)` is always SbS
+/// regardless (PRD user story 17 + 30: the Quest viewer's stream is
+/// uninterrupted while the operator iterates between alignment views).
+///
+/// - `.sbs`: side-by-side, identical to the NDI output. Default.
+/// - `.anaglyph`: pure-luma red/cyan anaglyph. Left source's BT.709
+///   luma → red channel; right source's luma → green and blue
+///   channels. `swapEyes` inverts the assignment.
+/// - `.channelTest`: solid red on the left half, solid cyan on the
+///   right half. Sources are bypassed — operators flip into this mode
+///   to verify their anaglyph glasses are oriented correctly before
+///   doing real alignment work.
+enum ScreenMode: String, CaseIterable, Sendable {
+    case sbs
+    case anaglyph
+    case channelTest
 }
 
 @MainActor
@@ -87,6 +108,21 @@ final class AlignmentState {
     /// doing" use.
     var cropMode: CropMode = .auto
 
+    /// What the iPad preview screen renders (SbS, anaglyph, or the
+    /// channel-test pattern). Only affects the on-screen render path;
+    /// the NDI-output pipeline always sends SbS regardless. Default
+    /// `.sbs` so the resting state matches what the Quest viewer sees.
+    /// The slice #8 hookup is a debug-only menu; slice #9 wires up the
+    /// proper segmented-control UI.
+    var screenMode: ScreenMode = .sbs
+
+    /// Inverts which source feeds the red channel in `.anaglyph` mode
+    /// (default: left → red, right → green+blue; swapped: right → red,
+    /// left → green+blue). No effect in `.sbs` or `.channelTest` mode
+    /// — by design, so flipping back to SbS leaves the operator's
+    /// alignment view unchanged.
+    var swapEyes: Bool = false
+
     /// Effective per-eye HIT in source pixels (sub-pixel precision
     /// preserved). Compositor reads this fresh on every frame.
     var leftHIT: Double {
@@ -101,6 +137,10 @@ final class AlignmentState {
                                 rightFine: rightFineHIT).right
     }
 
+    /// Zeros HIT state but intentionally preserves `cropMode`,
+    /// `screenMode`, and `swapEyes` — operators frequently reset HIT
+    /// mid-take while keeping their preferred crop / preview-mode /
+    /// glasses-orientation choices in place.
     func resetAll() {
         convergence = 0
         leftFineHIT = 0
