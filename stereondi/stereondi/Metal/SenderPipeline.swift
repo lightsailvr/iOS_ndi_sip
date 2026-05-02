@@ -95,12 +95,19 @@ final class SenderPipeline {
     /// UYVY, then ship the bytes to the NDISender on GPU completion.
     /// Drops the frame silently if the sender is offline or if any
     /// of the GPU resources fail to allocate this tick.
-    func send(pair: StereoFramePair, compositor: StereoCompositor) {
+    ///
+    /// `alignment` is read fresh on each call (per PRD: HIT changes
+    /// reflect in the NDI output within one frame), so the caller can
+    /// pass the same long-lived AlignmentState reference every tick.
+    func send(pair: StereoFramePair,
+              alignment: AlignmentState,
+              compositor: StereoCompositor) {
         guard sender.isRunning else { return }
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
         commandBuffer.label = "SenderPipeline"
 
         guard let bgraTex = compositor.renderForSender(pair: pair,
+                                                       alignment: alignment,
                                                        commandBuffer: commandBuffer) else {
             return
         }
