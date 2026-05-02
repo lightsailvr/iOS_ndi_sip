@@ -4,34 +4,38 @@ import SwiftUI
 
 struct ContentView: View {
     @State private var receiver = NDIReceiver.receiver()
-    @State private var browser: NDIDiscoveryFirstSource? = nil
-    @State private var connectedSourceName: String? = nil
+    @State private var selection = SourceSelection()
+    @State private var discovered = DiscoveredSources()
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             MetalPreviewView(receiver: receiver).ignoresSafeArea()
-            if connectedSourceName == nil {
-                VStack(spacing: 12) {
-                    ProgressView()
-                    Text("Searching for NDI sources…")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
+
+            VStack {
+                TopBar(selection: selection, discovered: discovered)
+                Spacer()
+            }
+
+            if selection.leftSource == nil {
+                searchOverlay
             }
         }
-        .task {
-            await locateFirstSource()
+        .onChange(of: selection.leftSource) { _, newLeft in
+            if let left = newLeft {
+                receiver.connect(toSourceName: left.name, urlAddress: left.urlAddress)
+            } else {
+                receiver.disconnect()
+            }
         }
     }
 
-    private func locateFirstSource() async {
-        let browser = NDIDiscoveryFirstSource.startBrowsing()
-        self.browser = browser
-        browser.waitForFirstSource(30.0) { name, url in
-            guard let name, let url else { return }
-            receiver.connect(toSourceName: name, urlAddress: url)
-            connectedSourceName = name
+    private var searchOverlay: some View {
+        VStack(spacing: 8) {
+            ProgressView()
+            Text("Pick a source from the top bar")
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
     }
 }
