@@ -5,6 +5,7 @@
 
 #import <Processing.NDI.Lib.h>
 
+#import <QuartzCore/QuartzCore.h>
 #import <atomic>
 #import <os/lock.h>
 #import <os/log.h>
@@ -86,7 +87,9 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
                               width:(NSInteger)width
                              height:(NSInteger)height
                           frameRate:(double)frameRate
-                    timecodeSeconds:(NSTimeInterval)timecode {
+                    timecodeSeconds:(NSTimeInterval)timecode
+                       isInterlaced:(BOOL)isInterlaced
+                           hasAlpha:(BOOL)hasAlpha {
     self = [super init];
     if (!self) {
         return nil;
@@ -96,6 +99,8 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
     _height = height;
     _frameRate = frameRate;
     _timecodeSeconds = timecode;
+    _isInterlaced = isInterlaced;
+    _hasAlpha = hasAlpha;
     return self;
 }
 
@@ -115,6 +120,21 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
     os_unfair_lock _lifecycleLock;
     std::atomic<NSInteger> _state;
     NSString *_currentSourceName;
+    NSString *_currentSourceURL;
+
+    // Wall-clock snap of the most recent successful frame. Stored as
+    // a uint64_t bitcast of CFTimeInterval (double) so it can be
+    // updated atomically from the latestFrame thread without taking
+    // the lifecycle lock for every frame.
+    std::atomic<uint64_t> _lastFrameTimeBits;
+
+    // Most recent frame's properties — populated on every successful
+    // capture so the SwiftUI side can read dimensions / interlace /
+    // alpha for warning banners without retaining the frame itself.
+    std::atomic<NSInteger> _lastFrameWidth;
+    std::atomic<NSInteger> _lastFrameHeight;
+    std::atomic<bool> _lastFrameInterlaced;
+    std::atomic<bool> _lastFrameHasAlpha;
 }
 
 + (instancetype)receiver {
@@ -128,6 +148,11 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
     }
     _lifecycleLock = OS_UNFAIR_LOCK_INIT;
     _state.store(NDIReceiverStateIdle, std::memory_order_release);
+    _lastFrameTimeBits.store(0, std::memory_order_release);
+    _lastFrameWidth.store(0, std::memory_order_release);
+    _lastFrameHeight.store(0, std::memory_order_release);
+    _lastFrameInterlaced.store(false, std::memory_order_release);
+    _lastFrameHasAlpha.store(false, std::memory_order_release);
     return self;
 }
 
@@ -146,18 +171,145 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
     return name;
 }
 
+- (NSTimeInterval)lastFrameTimestamp {
+    uint64_t bits = _lastFrameTimeBits.load(std::memory_order_acquire);
+    NSTimeInterval value = 0;
+    static_assert(sizeof(uint64_t) == sizeof(NSTimeInterval),
+                  "lastFrameTimestamp atomic packing requires 64-bit double");
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+- (NSTimeInterval)timeSinceLastFrame {
+    NSTimeInterval last = self.lastFrameTimestamp;
+    if (last == 0.0) {
+        return INFINITY;
+    }
+    return CACurrentMediaTime() - last;
+}
+
+- (NSInteger)lastFrameWidth {
+    return _lastFrameWidth.load(std::memory_order_acquire);
+}
+
+- (NSInteger)lastFrameHeight {
+    return _lastFrameHeight.load(std::memory_order_acquire);
+}
+
+- (BOOL)lastFrameInterlaced {
+    return _lastFrameInterlaced.load(std::memory_order_acquire) ? YES : NO;
+}
+
+- (BOOL)lastFrameHasAlpha {
+    return _lastFrameHasAlpha.load(std::memory_order_acquire) ? YES : NO;
+}
+
+// Atomically swap state; if the value actually changed, fire the
+// onStateChange callback on the main thread. Safe to call from any
+// thread (the latestFrame path uses this to flip
+// .connecting → .live and .stalled → .live).
+- (void)transitionToState:(NDIReceiverState)newState {
+    NSInteger previous = _state.exchange((NSInteger)newState,
+                                         std::memory_order_acq_rel);
+    if (previous == (NSInteger)newState) {
+        return;
+    }
+    void (^callback)(NDIReceiverState) = self.onStateChange;
+    if (!callback) {
+        return;
+    }
+    if ([NSThread isMainThread]) {
+        callback(newState);
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            callback(newState);
+        });
+    }
+}
+
 - (void)connectToSourceName:(NSString *)name urlAddress:(NSString *)urlAddress {
     if (name.length == 0 && urlAddress.length == 0) {
         os_log_error(receiverLog(), "connectToSourceName called with empty name and url");
         return;
     }
 
+    // Capture the request, then route through the shared open path so
+    // kickReconnect and the initial connect share the same plumbing.
     [self disconnect];
 
+    os_unfair_lock_lock(&_lifecycleLock);
+    _currentSourceName = [name copy];
+    _currentSourceURL = [urlAddress copy];
+    os_unfair_lock_unlock(&_lifecycleLock);
+
+    [self openContextForName:name urlAddress:urlAddress];
+}
+
+- (void)disconnect {
+    NDIReceiverContext *context = nil;
+    os_unfair_lock_lock(&_lifecycleLock);
+    context = _context;
+    _context = nil;
+    _currentSourceName = nil;
+    _currentSourceURL = nil;
+    os_unfair_lock_unlock(&_lifecycleLock);
+
+    _lastFrameTimeBits.store(0, std::memory_order_release);
+    _lastFrameWidth.store(0, std::memory_order_release);
+    _lastFrameHeight.store(0, std::memory_order_release);
+    _lastFrameInterlaced.store(false, std::memory_order_release);
+    _lastFrameHasAlpha.store(false, std::memory_order_release);
+
+    [self transitionToState:NDIReceiverStateIdle];
+
+    // Releasing the context here drops the receiver's strong ref; in-flight
+    // frames retain the context separately via their pixel-buffer release
+    // callbacks, so framesync_destroy / recv_destroy run only after the last
+    // CVPixelBuffer is released.
+    (void)context;
+}
+
+- (void)kickReconnect {
+    NSString *name = nil;
+    NSString *url = nil;
+    os_unfair_lock_lock(&_lifecycleLock);
+    name = [_currentSourceName copy];
+    url = [_currentSourceURL copy];
+    os_unfair_lock_unlock(&_lifecycleLock);
+
+    if (name.length == 0 && url.length == 0) {
+        return;
+    }
+
+    // Tear down the current context BUT keep the cached
+    // (name, url) so the open path below picks them back up. We
+    // reach inside lifecycle ourselves rather than calling -disconnect
+    // because the latter clears the cached identifiers.
+    NDIReceiverContext *context = nil;
+    os_unfair_lock_lock(&_lifecycleLock);
+    context = _context;
+    _context = nil;
+    os_unfair_lock_unlock(&_lifecycleLock);
+
+    _lastFrameTimeBits.store(0, std::memory_order_release);
+    _lastFrameWidth.store(0, std::memory_order_release);
+    _lastFrameHeight.store(0, std::memory_order_release);
+    _lastFrameInterlaced.store(false, std::memory_order_release);
+    _lastFrameHasAlpha.store(false, std::memory_order_release);
+    (void)context;
+
+    [self openContextForName:name urlAddress:url];
+}
+
+// Shared open path. Called from -connectToSourceName:urlAddress: and
+// -kickReconnect. Caller is responsible for clearing any previous
+// context first (and for setting _currentSourceName/_currentSourceURL
+// on initial connect).
+- (void)openContextForName:(NSString *)name urlAddress:(NSString *)urlAddress {
     BOOL holdsRuntimeRef = [NDIRuntime start];
     if (!holdsRuntimeRef) {
         os_log_error(receiverLog(), "NDIRuntime failed to start; receiver disabled");
-        _state.store(NDIReceiverStateDisconnected, std::memory_order_release);
+        [self transitionToState:NDIReceiverStateDisconnected];
         return;
     }
 
@@ -171,19 +323,29 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
 
     NDIlib_recv_create_v3_t createSettings;
     createSettings.source_to_connect_to = source;
-    // UYVY where source is YUV; BGRA where source has alpha. Slice #4's
-    // compositor will sample UYVY directly via Metal — no conversion to BGRA
-    // unless the source forces it.
+    // UYVY where source is YUV; BGRA where source has alpha. The
+    // compositor's BGRA fragment shader pre-multiplies against black
+    // unconditionally, which is correct for opaque BGRA (no-op) AND for
+    // alpha-bearing BGRA (PRD: "alpha sources premultiplied against
+    // black at receive"). Color-space mismatch: NDI's FrameSync
+    // converts non-BT.709 sources to BT.709 limited at receive (the
+    // SDK promises this for the Standard SDK's UYVY/BGRA color formats),
+    // so no additional CPU-side conversion is required here.
     createSettings.color_format = NDIlib_recv_color_format_UYVY_BGRA;
     createSettings.bandwidth = NDIlib_recv_bandwidth_highest;
-    createSettings.allow_video_fields = false;
+    // FrameSync is asked to deinterlace upstream (we capture as
+    // progressive). Sources that can't be deinterlaced surface their
+    // dominant field via FrameSync's fallback; the SwiftUI side
+    // detects the residual interlace via NDIVideoFrame.isInterlaced
+    // and shows a warning banner.
+    createSettings.allow_video_fields = true;
     createSettings.p_ndi_recv_name = "Stereo NDI Preview";
 
     NDIlib_recv_instance_t recv = NDIlib_recv_create_v3(&createSettings);
     if (!recv) {
         os_log_error(receiverLog(), "NDIlib_recv_create_v3 returned null");
         [NDIRuntime stop];
-        _state.store(NDIReceiverStateDisconnected, std::memory_order_release);
+        [self transitionToState:NDIReceiverStateDisconnected];
         return;
     }
 
@@ -192,7 +354,7 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
         os_log_error(receiverLog(), "NDIlib_framesync_create returned null");
         NDIlib_recv_destroy(recv);
         [NDIRuntime stop];
-        _state.store(NDIReceiverStateDisconnected, std::memory_order_release);
+        [self transitionToState:NDIReceiverStateDisconnected];
         return;
     }
 
@@ -203,31 +365,13 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
 
     os_unfair_lock_lock(&_lifecycleLock);
     _context = context;
-    _currentSourceName = [name copy];
     os_unfair_lock_unlock(&_lifecycleLock);
 
-    _state.store(NDIReceiverStateConnecting, std::memory_order_release);
+    [self transitionToState:NDIReceiverStateConnecting];
     os_log_info(receiverLog(),
-                "NDIReceiver connecting to '%{public}s' @ %{public}s",
+                "NDIReceiver opened context for '%{public}s' @ %{public}s",
                 cName ? cName : "(no name)",
                 cURL ? cURL : "(no url)");
-}
-
-- (void)disconnect {
-    NDIReceiverContext *context = nil;
-    os_unfair_lock_lock(&_lifecycleLock);
-    context = _context;
-    _context = nil;
-    _currentSourceName = nil;
-    os_unfair_lock_unlock(&_lifecycleLock);
-
-    _state.store(NDIReceiverStateIdle, std::memory_order_release);
-
-    // Releasing the context here drops the receiver's strong ref; in-flight
-    // frames retain the context separately via their pixel-buffer release
-    // callbacks, so framesync_destroy / recv_destroy run only after the last
-    // CVPixelBuffer is released.
-    (void)context;
 }
 
 - (nullable NDIVideoFrame *)latestFrame {
@@ -255,20 +399,33 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
     }
 
     OSType pixelFormat = 0;
+    BOOL hasAlpha = NO;
     switch (video.FourCC) {
         case NDIlib_FourCC_video_type_UYVY:
             pixelFormat = kCVPixelFormatType_422YpCbCr8;
             break;
         case NDIlib_FourCC_video_type_BGRA:
             pixelFormat = kCVPixelFormatType_32BGRA;
+            // BGRA-with-alpha-presence is detected at the frame-format
+            // level rather than scanning pixels (per-frame O(W·H) for an
+            // O(1) decision is wrong). NDI's BGRA FourCC implies alpha
+            // *may* be present, so treat it as such by default — the
+            // shader's premultiply-against-black is a no-op when the
+            // source is fully opaque.
+            hasAlpha = YES;
             break;
         default:
             os_log_error(receiverLog(),
-                         "Unsupported NDI FourCC 0x%{public}x in slice #2; dropping frame",
+                         "Unsupported NDI FourCC 0x%{public}x; dropping frame",
                          (unsigned)video.FourCC);
             NDIlib_framesync_free_video(context->framesync, &video);
             return nil;
     }
+
+    BOOL isInterlaced =
+        (video.frame_format_type == NDIlib_frame_format_type_interleaved ||
+         video.frame_format_type == NDIlib_frame_format_type_field_0 ||
+         video.frame_format_type == NDIlib_frame_format_type_field_1);
 
     const size_t width = (size_t)video.xres;
     const size_t height = (size_t)video.yres;
@@ -306,8 +463,31 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
         return nil;
     }
 
-    if (_state.load(std::memory_order_acquire) == NDIReceiverStateConnecting) {
-        _state.store(NDIReceiverStateLive, std::memory_order_release);
+    // Snap the wall clock for stall detection. Stored as a uint64_t
+    // bitcast of the double so callers reading from the watchdog
+    // thread see a consistent value without taking the lifecycle lock.
+    const NSTimeInterval now = CACurrentMediaTime();
+    uint64_t bits = 0;
+    static_assert(sizeof(uint64_t) == sizeof(NSTimeInterval),
+                  "lastFrameTimestamp atomic packing requires 64-bit double");
+    memcpy(&bits, &now, sizeof(bits));
+    _lastFrameTimeBits.store(bits, std::memory_order_release);
+    _lastFrameWidth.store((NSInteger)width, std::memory_order_release);
+    _lastFrameHeight.store((NSInteger)height, std::memory_order_release);
+    _lastFrameInterlaced.store(isInterlaced ? true : false,
+                               std::memory_order_release);
+    _lastFrameHasAlpha.store(hasAlpha ? true : false,
+                             std::memory_order_release);
+
+    // Recovery path: a successful capture out of .stalled means the
+    // source resumed without an explicit reconnect. The watchdog will
+    // also see this on its next tick, but flipping here keeps the
+    // state consistent for any reader that polls between watchdog
+    // ticks.
+    NSInteger currentState = _state.load(std::memory_order_acquire);
+    if (currentState == NDIReceiverStateConnecting ||
+        currentState == NDIReceiverStateStalled) {
+        [self transitionToState:NDIReceiverStateLive];
     }
 
     const double frameRate = video.frame_rate_D > 0
@@ -320,7 +500,9 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
                                                                 width:(NSInteger)width
                                                                height:(NSInteger)height
                                                             frameRate:frameRate
-                                                      timecodeSeconds:timecodeSeconds];
+                                                      timecodeSeconds:timecodeSeconds
+                                                         isInterlaced:isInterlaced
+                                                             hasAlpha:hasAlpha];
     CFRelease(pixelBuffer);
     return frame;
 }
