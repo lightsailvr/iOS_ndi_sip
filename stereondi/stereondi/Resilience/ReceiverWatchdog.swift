@@ -51,6 +51,9 @@ protocol WatchableReceiver: AnyObject {
     nonisolated var lastFrameHeight: Int { get }
     nonisolated var lastFrameInterlaced: Bool { get }
     nonisolated var lastFrameHasAlpha: Bool { get }
+    /// Slice #13: surfaced on the per-eye StatusRow ("@ <fps> fps").
+    /// 0 until the first frame arrives.
+    nonisolated var lastFrameRate: Double { get }
 
     nonisolated func kickReconnect()
 }
@@ -255,7 +258,7 @@ final class ReceiverWatchdog {
             }
             return .live(width: receiver.lastFrameWidth,
                          height: receiver.lastFrameHeight,
-                         frameRate: 0)
+                         frameRate: receiver.lastFrameRate)
         case .stalled:
             kickIfDue(receiver: receiver, side: side, now: now)
             return .stalled

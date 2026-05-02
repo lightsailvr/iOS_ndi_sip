@@ -135,6 +135,12 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
     std::atomic<NSInteger> _lastFrameHeight;
     std::atomic<bool> _lastFrameInterlaced;
     std::atomic<bool> _lastFrameHasAlpha;
+
+    // uint64_t bitcast of the last observed frame rate (double). Slice
+    // #13 surfaces this on the per-eye StatusRow; same atomic-packing
+    // trick as _lastFrameTimeBits so a main-actor read from a
+    // background latestFrame call sees a consistent value lock-free.
+    std::atomic<uint64_t> _lastFrameRateBits;
 }
 
 + (instancetype)receiver {
@@ -153,6 +159,7 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
     _lastFrameHeight.store(0, std::memory_order_release);
     _lastFrameInterlaced.store(false, std::memory_order_release);
     _lastFrameHasAlpha.store(false, std::memory_order_release);
+    _lastFrameRateBits.store(0, std::memory_order_release);
     return self;
 }
 
@@ -202,6 +209,15 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
 
 - (BOOL)lastFrameHasAlpha {
     return _lastFrameHasAlpha.load(std::memory_order_acquire) ? YES : NO;
+}
+
+- (double)lastFrameRate {
+    uint64_t bits = _lastFrameRateBits.load(std::memory_order_acquire);
+    double value = 0;
+    static_assert(sizeof(uint64_t) == sizeof(double),
+                  "lastFrameRate atomic packing requires 64-bit double");
+    memcpy(&value, &bits, sizeof(value));
+    return value;
 }
 
 // Atomically swap state; if the value actually changed, fire the
@@ -259,6 +275,7 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
     _lastFrameHeight.store(0, std::memory_order_release);
     _lastFrameInterlaced.store(false, std::memory_order_release);
     _lastFrameHasAlpha.store(false, std::memory_order_release);
+    _lastFrameRateBits.store(0, std::memory_order_release);
 
     [self transitionToState:NDIReceiverStateIdle];
 
@@ -296,6 +313,7 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
     _lastFrameHeight.store(0, std::memory_order_release);
     _lastFrameInterlaced.store(false, std::memory_order_release);
     _lastFrameHasAlpha.store(false, std::memory_order_release);
+    _lastFrameRateBits.store(0, std::memory_order_release);
     (void)context;
 
     [self openContextForName:name urlAddress:url];
@@ -479,6 +497,17 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
     _lastFrameHasAlpha.store(hasAlpha ? true : false,
                              std::memory_order_release);
 
+    const double frameRate = video.frame_rate_D > 0
+        ? (double)video.frame_rate_N / (double)video.frame_rate_D
+        : 0.0;
+    {
+        uint64_t rateBits = 0;
+        static_assert(sizeof(uint64_t) == sizeof(double),
+                      "lastFrameRate atomic packing requires 64-bit double");
+        memcpy(&rateBits, &frameRate, sizeof(rateBits));
+        _lastFrameRateBits.store(rateBits, std::memory_order_release);
+    }
+
     // Recovery path: a successful capture out of .stalled means the
     // source resumed without an explicit reconnect. The watchdog will
     // also see this on its next tick, but flipping here keeps the
@@ -490,9 +519,6 @@ static void NDIReleasePixelBufferBytes(void *releaseRefCon, const void * /*baseA
         [self transitionToState:NDIReceiverStateLive];
     }
 
-    const double frameRate = video.frame_rate_D > 0
-        ? (double)video.frame_rate_N / (double)video.frame_rate_D
-        : 0.0;
     // NDI timecode is 100-ns intervals.
     const NSTimeInterval timecodeSeconds = (NSTimeInterval)video.timecode * 1.0e-7;
 
