@@ -4,7 +4,7 @@
 //  dropdowns (Left, Right), a Swap button between them, the iPad
 //  screen-mode segmented control (SbS / Anaglyph / Channel Test), an
 //  overflow menu that surfaces the swap-eyes toggle when in anaglyph
-//  mode, and a disabled Settings gear placeholder.
+//  mode, and a Settings gear that presents the SettingsSheet.
 //
 //  Slice #3 wired the source pickers and the Swap button.
 //  Slice #6 added the bottom-bar HIT controls (no TopBar change).
@@ -13,6 +13,11 @@
 //  that with the proper segmented control here. The NDI-output pipeline
 //  is unaffected by screen-mode changes — `StereoCompositor`
 //  `renderForSender(...)` is hard-wired to SbS regardless.
+//
+//  Slice #10 enables the gear: it now presents the SettingsSheet over
+//  the bound `OutputStreamConfig`. ContentView's onChange handlers on
+//  the config's effective values feed the SenderPipeline so a rename
+//  hits the wire within one pairer tick.
 //
 //  The overflow menu is only mounted when `screenMode == .anaglyph` so
 //  the swap-eyes toggle is hidden in modes where it has no effect (this
@@ -29,9 +34,11 @@ import SwiftUI
 struct TopBar: View {
     @Bindable var selection: SourceSelection
     @Bindable var alignment: AlignmentState
+    @Bindable var output: OutputStreamConfig
     var discovered: DiscoveredSources
 
     @State private var presentingPickerForSide: SourcePickerSheet.Side?
+    @State private var settingsPresented: Bool = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -61,12 +68,13 @@ struct TopBar: View {
 
             Spacer(minLength: 8)
 
-            Button(action: {}) {
+            Button {
+                settingsPresented = true
+            } label: {
                 Image(systemName: "gear")
                     .font(.title3)
             }
             .buttonStyle(.bordered)
-            .disabled(true)
             .accessibilityLabel("Settings")
         }
         .padding(.horizontal, 12)
@@ -80,6 +88,9 @@ struct TopBar: View {
                 selection: binding(for: side),
                 discovered: discovered
             )
+        }
+        .sheet(isPresented: $settingsPresented) {
+            SettingsSheet(output: output)
         }
     }
 
