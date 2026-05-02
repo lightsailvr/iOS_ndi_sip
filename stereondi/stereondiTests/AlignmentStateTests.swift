@@ -138,4 +138,65 @@ struct AlignmentStateTests {
         #expect(state.convergence == 0)
         #expect(state.cropMode == .off)
     }
+
+    // MARK: - Slice #8: screenMode + swapEyes
+
+    @Test
+    func screenModeDefaultsToSbS() {
+        let state = AlignmentState()
+        #expect(state.screenMode == .sbs)
+    }
+
+    @Test
+    func screenModeTransitionsAcrossAllCases() {
+        let state = AlignmentState()
+        state.screenMode = .anaglyph
+        #expect(state.screenMode == .anaglyph)
+        state.screenMode = .channelTest
+        #expect(state.screenMode == .channelTest)
+        state.screenMode = .sbs
+        #expect(state.screenMode == .sbs)
+    }
+
+    @Test
+    func swapEyesDefaultsFalse() {
+        let state = AlignmentState()
+        #expect(state.swapEyes == false)
+    }
+
+    @Test
+    func swapEyesToggles() {
+        let state = AlignmentState()
+        state.swapEyes = true
+        #expect(state.swapEyes == true)
+        state.swapEyes = false
+        #expect(state.swapEyes == false)
+    }
+
+    @Test
+    func resetAllPreservesScreenMode() {
+        // resetAll() zeros HIT but intentionally leaves screenMode in
+        // place — operators frequently reset alignment mid-take while
+        // keeping their chosen preview mode (e.g. staying in anaglyph
+        // for the next take's alignment pass).
+        let state = AlignmentState()
+        state.screenMode = .anaglyph
+        state.convergence = 100
+        state.resetAll()
+        #expect(state.convergence == 0)
+        #expect(state.screenMode == .anaglyph)
+    }
+
+    @Test
+    func resetAllPreservesSwapEyes() {
+        // Same rationale as cropMode + screenMode: a mismatched glasses
+        // orientation discovered at the start of a session shouldn't
+        // need to be re-discovered after every alignment reset.
+        let state = AlignmentState()
+        state.swapEyes = true
+        state.convergence = 100
+        state.resetAll()
+        #expect(state.convergence == 0)
+        #expect(state.swapEyes == true)
+    }
 }
