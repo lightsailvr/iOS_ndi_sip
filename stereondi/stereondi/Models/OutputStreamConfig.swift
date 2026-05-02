@@ -14,14 +14,11 @@
 //  to "Stereo Preview" rather than asking the SDK to advertise an
 //  empty name (which would likely fail or produce a cryptic name).
 //
-//  Persistence (round-trip across launches via `UserDefaults`) is
-//  intentionally NOT in this slice — slice #11 (`SessionStore`) handles
-//  it. Renaming the stream and relaunching the app loses the
-//  customization until then.
-//
-//  Slice #10 scope: the two output-stream-related fields. The full
-//  Settings sheet polish — NDI® attribution, version info, etc. — is
-//  the larger Settings slice (#14).
+//  Slice #11 scope: persistence. The model now hydrates `streamName`
+//  and `groups` from the supplied `SessionStore` at init time and
+//  writes through on every change via `didSet`. Same `persistsToStore`
+//  init-flag pattern as AlignmentState — the load doesn't immediately
+//  re-write the restored values back through to UserDefaults.
 
 import Foundation
 import Observation
@@ -35,13 +32,17 @@ final class OutputStreamConfig {
     /// Raw, user-editable stream-name string. Bound directly to the
     /// Settings sheet's `TextField` so the cursor / keyboard behavior
     /// is unsurprising; the sender consumes `effectiveStreamName`.
-    var streamName: String = OutputStreamConfig.defaultStreamName
+    var streamName: String = OutputStreamConfig.defaultStreamName {
+        didSet { if persistsToStore { store.streamName = streamName } }
+    }
 
     /// Raw, user-editable comma-separated groups string. NDI accepts
     /// the comma-separated form natively (`NDIlib_send_create`'s
     /// `p_groups` is "comma-separated list of groups"), so we don't
     /// need to parse it into an array — only sanitize.
-    var groups: String = OutputStreamConfig.defaultGroups
+    var groups: String = OutputStreamConfig.defaultGroups {
+        didSet { if persistsToStore { store.groups = groups } }
+    }
 
     /// Trimmed stream name, falling back to the default when the
     /// operator clears the field entirely. The sender is never asked
@@ -58,5 +59,15 @@ final class OutputStreamConfig {
     var effectiveGroups: String? {
         let trimmed = groups.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private let store: SessionStore
+    private var persistsToStore: Bool = false
+
+    init(store: SessionStore = .shared) {
+        self.store = store
+        self.streamName = store.streamName
+        self.groups = store.groups
+        self.persistsToStore = true
     }
 }
