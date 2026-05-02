@@ -10,5 +10,6 @@
 #import "NDI/NDIDiscovery.h"
 #import "NDI/NDIReceiver.h"
 #import "NDI/NDIRuntime.h"
+#import "NDI/NDISender.h"
 
 #endif /* stereondi_Bridging_Header_h */

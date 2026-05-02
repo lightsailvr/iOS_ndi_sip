@@ -31,6 +31,13 @@ final class StereoCompositor {
         case pipelineCreationFailed(Swift.Error)
     }
 
+    /// Width of the offscreen render target consumed by the NDI
+    /// sender pipeline. Per PRD: v1 always outputs 1920×1080 SbS.
+    static let senderOutputWidth = 1920
+    /// Height of the offscreen render target consumed by the NDI
+    /// sender pipeline. Per PRD: v1 always outputs 1920×1080 SbS.
+    static let senderOutputHeight = 1080
+
     private let device: MTLDevice
     private let vertexFunction: MTLFunction
     private let fragmentBGRA: MTLFunction
@@ -43,6 +50,12 @@ final class StereoCompositor {
     // .bgra8Unorm_srgb (golden-image test target) without the caller
     // having to pre-declare which.
     private var pipelineCache: [PipelineKey: MTLRenderPipelineState] = [:]
+
+    // Lazily-allocated 1920×1080 .bgra8Unorm offscreen render target
+    // for the NDI sender path. Reused across frames; rebuilt only if
+    // the device hands back a nil texture. .private storage because
+    // the consumer (UYVYEncoder) is a GPU compute pass.
+    private var senderTarget: MTLTexture?
 
     init(device: MTLDevice) throws {
         self.device = device
@@ -116,6 +129,39 @@ final class StereoCompositor {
                 _ = inflight
             }
         }
+    }
+
+    /// Render the SbS composite of `pair` into the compositor's owned
+    /// 1920×1080 offscreen BGRA target and return that texture. The
+    /// caller appends a UYVY-encode compute pass on the same command
+    /// buffer and reads the result back via a completion handler.
+    /// Returns nil if the offscreen target couldn't be allocated.
+    func renderForSender(pair: StereoFramePair,
+                         commandBuffer: MTLCommandBuffer) -> MTLTexture? {
+        guard let target = ensureSenderTarget() else {
+            return nil
+        }
+        render(pair: pair, into: target, commandBuffer: commandBuffer)
+        return target
+    }
+
+    private func ensureSenderTarget() -> MTLTexture? {
+        if let existing = senderTarget,
+           existing.width == Self.senderOutputWidth,
+           existing.height == Self.senderOutputHeight {
+            return existing
+        }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: Self.senderOutputWidth,
+            height: Self.senderOutputHeight,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .private
+        let target = device.makeTexture(descriptor: descriptor)
+        senderTarget = target
+        return target
     }
 
     // MARK: - Per-side draw
