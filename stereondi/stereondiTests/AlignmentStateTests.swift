@@ -6,6 +6,19 @@
 //     left to negative HIT, right to positive HIT)
 //   - sub-pixel precision is preserved through nudgeConvergence
 //   - resetAll() zeros all three fields
+//
+//  Slice #11: AlignmentState now hydrates from / writes through to a
+//  SessionStore. Each test uses `freshAlignment()` which builds the
+//  state over a per-test `UserDefaults(suiteName: UUID().uuidString)!`
+//  so cross-test pollution and pollution of the standard suite are
+//  both impossible. The test-method body still exercises the same
+//  pure clamp / split / reset / nudge invariants the slices #6/#7/#8/#9
+//  tests do — the SessionStore swap-out is invisible to the test
+//  body. (Per-test suites are deliberately leaked here rather than
+//  removed in a tearDown — Swift Testing doesn't have an `afterEach`,
+//  the suite contents are tiny, and the UUID name guarantees no
+//  collision; the SessionStoreTests exercise the explicit removal
+//  path via its own `withFreshSuite(_:)` helper.)
 
 import Foundation
 import Testing
@@ -14,23 +27,28 @@ import Testing
 @MainActor
 struct AlignmentStateTests {
 
+    private static func freshAlignment() -> AlignmentState {
+        let suite = UserDefaults(suiteName: "stereondi.tests.\(UUID().uuidString)")!
+        return AlignmentState(store: SessionStore(defaults: suite))
+    }
+
     @Test
     func convergenceClampsBeyondPositiveLimit() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.convergence = 1000
         #expect(state.convergence == 400)
     }
 
     @Test
     func convergenceClampsBeyondNegativeLimit() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.convergence = -1000
         #expect(state.convergence == -400)
     }
 
     @Test
     func leftFineHITClamps() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.leftFineHIT = 999
         #expect(state.leftFineHIT == 400)
         state.leftFineHIT = -999
@@ -39,7 +57,7 @@ struct AlignmentStateTests {
 
     @Test
     func rightFineHITClamps() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.rightFineHIT = 999
         #expect(state.rightFineHIT == 400)
         state.rightFineHIT = -999
@@ -48,7 +66,7 @@ struct AlignmentStateTests {
 
     @Test
     func convergenceSplitsOppositely() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.convergence = 100
         #expect(state.leftHIT == -50)
         #expect(state.rightHIT == 50)
@@ -56,7 +74,7 @@ struct AlignmentStateTests {
 
     @Test
     func perEyeFineAddsToConvergenceShift() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.convergence = 100
         state.leftFineHIT = 10
         state.rightFineHIT = -10
@@ -66,7 +84,7 @@ struct AlignmentStateTests {
 
     @Test
     func resetAllZeros() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.convergence = 123
         state.leftFineHIT = 45
         state.rightFineHIT = -67
@@ -80,7 +98,7 @@ struct AlignmentStateTests {
 
     @Test
     func nudgeConvergencePreservesSubPixel() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.nudgeConvergence(by: 0.1)
         #expect(state.convergence == 0.1)
         state.nudgeConvergence(by: 0.1)
@@ -92,7 +110,7 @@ struct AlignmentStateTests {
 
     @Test
     func nudgeConvergenceClampsAtLimit() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.convergence = 399.95
         state.nudgeConvergence(by: 1.0)
         #expect(state.convergence == 400)
@@ -100,7 +118,7 @@ struct AlignmentStateTests {
 
     @Test
     func nudgeConvergenceClampsAtNegativeLimit() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.convergence = -399.95
         state.nudgeConvergence(by: -1.0)
         #expect(state.convergence == -400)
@@ -108,7 +126,7 @@ struct AlignmentStateTests {
 
     @Test
     func defaultsAreAllZero() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         #expect(state.convergence == 0)
         #expect(state.leftFineHIT == 0)
         #expect(state.rightFineHIT == 0)
@@ -118,7 +136,7 @@ struct AlignmentStateTests {
 
     @Test
     func cropToggle() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         #expect(state.cropMode == .auto)
         state.toggleCrop()
         #expect(state.cropMode == .off)
@@ -131,7 +149,7 @@ struct AlignmentStateTests {
         // resetAll() zeros HIT but intentionally leaves cropMode in
         // place — operators frequently reset alignment mid-take while
         // keeping their preferred crop view.
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.cropMode = .off
         state.convergence = 100
         state.resetAll()
@@ -143,13 +161,13 @@ struct AlignmentStateTests {
 
     @Test
     func screenModeDefaultsToSbS() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         #expect(state.screenMode == .sbs)
     }
 
     @Test
     func screenModeTransitionsAcrossAllCases() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.screenMode = .anaglyph
         #expect(state.screenMode == .anaglyph)
         state.screenMode = .channelTest
@@ -160,13 +178,13 @@ struct AlignmentStateTests {
 
     @Test
     func swapEyesDefaultsFalse() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         #expect(state.swapEyes == false)
     }
 
     @Test
     func swapEyesToggles() {
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.swapEyes = true
         #expect(state.swapEyes == true)
         state.swapEyes = false
@@ -179,7 +197,7 @@ struct AlignmentStateTests {
         // place — operators frequently reset alignment mid-take while
         // keeping their chosen preview mode (e.g. staying in anaglyph
         // for the next take's alignment pass).
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.screenMode = .anaglyph
         state.convergence = 100
         state.resetAll()
@@ -192,7 +210,7 @@ struct AlignmentStateTests {
         // Same rationale as cropMode + screenMode: a mismatched glasses
         // orientation discovered at the start of a session shouldn't
         // need to be re-discovered after every alignment reset.
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.swapEyes = true
         state.convergence = 100
         state.resetAll()
@@ -210,7 +228,7 @@ struct AlignmentStateTests {
         // creative-look pass before returning to anaglyph for fine
         // alignment — switching modes must never silently flip the
         // swap-eyes preference.
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.swapEyes = true
         state.screenMode = .anaglyph
         #expect(state.swapEyes == true)
@@ -223,7 +241,7 @@ struct AlignmentStateTests {
         // swap-eyes preference is glasses-orientation, not view-state,
         // so it must remain stable as the operator iterates between
         // modes that ignore it.
-        let state = AlignmentState()
+        let state = Self.freshAlignment()
         state.screenMode = .anaglyph
         state.swapEyes = true
         state.screenMode = .channelTest
