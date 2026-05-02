@@ -8,12 +8,14 @@
 //
 //  Sign convention:
 //   - convergence > 0  → leftHIT = -convergence/2, rightHIT = +convergence/2
-//   - That sends the left eye's UV offset NEGATIVE (sampling further
-//     LEFT in source) and the right eye's UV offset POSITIVE (further
-//     RIGHT). The visual result: each eye's image translates AWAY from
-//     the screen center. In stereoscopy terms, positive convergence
-//     reduces horizontal disparity at the convergence plane (objects
-//     converge in toward the viewer).
+//   - HIT > 0 means add a positive ΔU to that eye's source sampler
+//     (sample further RIGHT in source → the visible image translates
+//     LEFT). HIT < 0 is the mirror.
+//   - So positive convergence pushes the left eye's image RIGHT and
+//     the right eye's image LEFT — both images move TOWARD the screen
+//     centerline, which reduces horizontal disparity at the convergence
+//     plane. In stereoscopy terms, positive convergence brings the
+//     converged object closer in depth ("comes out of the screen").
 //   - leftFineHIT / rightFineHIT add to the convergence-derived base
 //     so an asymmetric lens offset can be corrected without disturbing
 //     the operator's primary convergence target.

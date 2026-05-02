@@ -55,9 +55,10 @@ final class StereoCompositor {
     /// Per-side fragment-shader buffer-0 contents. Layout MUST stay in
     /// sync with the `AlignmentUniforms` struct in `Compositor.metal`.
     /// `reservedCrop` is unused this slice; slice #7 repurposes it as
-    /// a mode flag and adds a `_padding` field — the Swift struct
-    /// already reserves the padding so the layout doesn't shift later.
-    struct AlignmentUniforms {
+    /// a mode flag — the Swift struct already reserves a trailing
+    /// padding float so the SIMD-aligned 16-byte layout doesn't shift
+    /// when `reservedCrop`'s meaning changes.
+    struct AlignmentUniforms: Sendable {
         var uMin: Float
         var uMax: Float
         var reservedCrop: Float = 0
@@ -227,10 +228,10 @@ final class StereoCompositor {
     ///
     /// When both HITs are zero, this collapses to (u_min=0, u_max=1) —
     /// the existing zero-HIT golden test continues to pass unchanged.
-    static func alignmentUniforms(forSideHITPixels hit: Double,
-                                  otherSideHITPixels otherHit: Double,
-                                  sourceWidthPixels: Int,
-                                  otherSourceWidthPixels: Int?) -> AlignmentUniforms {
+    nonisolated static func alignmentUniforms(forSideHITPixels hit: Double,
+                                              otherSideHITPixels otherHit: Double,
+                                              sourceWidthPixels: Int,
+                                              otherSourceWidthPixels: Int?) -> AlignmentUniforms {
         let srcW = Double(max(sourceWidthPixels, 1))
         let hitUV = AlignmentMath.hitToUVOffset(hitPixels: hit, sourceWidthPixels: srcW)
 
