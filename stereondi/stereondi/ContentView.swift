@@ -3,24 +3,35 @@
 import SwiftUI
 
 struct ContentView: View {
+    @State private var receiver = NDIReceiver.receiver()
+    @State private var browser: NDIDiscoveryFirstSource? = nil
+    @State private var connectedSourceName: String? = nil
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            VStack(spacing: 12) {
-                Image(systemName: "camera.metering.matrix")
-                    .imageScale(.large)
-                    .font(.system(size: 56, weight: .light))
-                    .foregroundStyle(.tint)
-                Text("Stereo NDI Preview")
-                    .font(.title2.weight(.semibold))
-                Text("NDI runtime: \(NDIRuntime.version())")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                Text("CPU supported: \(NDIRuntime.isSupportedCPU() ? "yes" : "no")")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+            MetalPreviewView(receiver: receiver).ignoresSafeArea()
+            if connectedSourceName == nil {
+                VStack(spacing: 12) {
+                    ProgressView()
+                    Text("Searching for NDI sources…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
             }
-            .padding()
+        }
+        .task {
+            await locateFirstSource()
+        }
+    }
+
+    private func locateFirstSource() async {
+        let browser = NDIDiscoveryFirstSource.startBrowsing()
+        self.browser = browser
+        browser.waitForFirstSource(30.0) { name, url in
+            guard let name, let url else { return }
+            receiver.connect(toSourceName: name, urlAddress: url)
+            connectedSourceName = name
         }
     }
 }
