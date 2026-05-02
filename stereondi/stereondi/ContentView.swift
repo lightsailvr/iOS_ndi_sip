@@ -1,19 +1,27 @@
 //  ContentView.swift
 //
 //  Wires the two NDI receivers, the FramePairer, the StereoCompositor,
-//  the MetalPreviewView, the SenderPipeline, and the AlignmentState
-//  together. Each side of `selection` drives its own receiver via
-//  .onChange; the pairer pulls both at vsync, the compositor draws
-//  their HIT-corrected SbS into the MTKView, and on the same tick the
-//  SenderPipeline pushes a 1920×1080 UYVY copy out via NDISender.
+//  the MetalPreviewView, the SenderPipeline, the AlignmentState, and
+//  the OutputStreamConfig together. Each side of `selection` drives
+//  its own receiver via .onChange; the pairer pulls both at vsync,
+//  the compositor draws their HIT-corrected SbS into the MTKView, and
+//  on the same tick the SenderPipeline pushes a 1920×1080 UYVY copy
+//  out via NDISender.
 //
-//  Slice #5 hardcodes the output stream name ("Stereo Preview") and
-//  groups ("Public"); slice #10 makes both editable from Settings.
-//
-//  Slice #6 adds the bottom alignment bar, the on-preview gesture
+//  Slice #6 added the bottom alignment bar, the on-preview gesture
 //  overlay (two-finger pan / pinch / double-tap), and threads a
 //  shared AlignmentState through both render paths so HIT changes
 //  reflect on the iPad screen and in the NDI output within one frame.
+//
+//  Slice #10 makes the output stream identity (name + groups) editable
+//  from the Settings sheet (gear icon in TopBar). The
+//  `OutputStreamConfig` model owns the raw + effective values; this
+//  view's `.onChange` handlers feed each effective-value change into
+//  `senderPipeline.reconfigure(...)`, which restarts the underlying
+//  NDISender in place. Scene-foreground transitions also re-call
+//  `reconfigure(...)` so the operator's last-applied identity survives
+//  background→foreground (in-memory only this slice; persistence
+//  across app launches is slice #11).
 
 import Metal
 import SwiftUI
@@ -26,6 +34,7 @@ struct ContentView: View {
     @State private var selection = SourceSelection()
     @State private var discovered = DiscoveredSources()
     @State private var alignment = AlignmentState()
+    @State private var output = OutputStreamConfig()
     @State private var zoom: CGFloat = 1.0
 
     @State private var compositor: StereoCompositor?
@@ -34,9 +43,6 @@ struct ContentView: View {
     @State private var commandQueue: MTLCommandQueue?
     @State private var senderPipeline: SenderPipeline?
     @State private var initError: String?
-
-    private static let defaultStreamName = "Stereo Preview"
-    private static let defaultGroups = "Public"
 
     var body: some View {
         ZStack {
@@ -68,6 +74,7 @@ struct ContentView: View {
             VStack {
                 TopBar(selection: selection,
                        alignment: alignment,
+                       output: output,
                        discovered: discovered)
                 Spacer()
                 BottomBar(alignment: alignment)
@@ -90,10 +97,23 @@ struct ContentView: View {
         .onChange(of: selection.rightSource) { _, newRight in
             apply(source: newRight, to: receiverRight)
         }
+        .onChange(of: output.effectiveStreamName) { _, newName in
+            senderPipeline?.reconfigure(streamName: newName,
+                                        groups: output.effectiveGroups)
+        }
+        .onChange(of: output.effectiveGroups) { _, newGroups in
+            senderPipeline?.reconfigure(streamName: output.effectiveStreamName,
+                                        groups: newGroups)
+        }
         .onChange(of: scenePhase) { _, newPhase in
             switch newPhase {
             case .active:
-                senderPipeline?.start()
+                // Re-apply current identity on foreground rather than
+                // a bare start() — keeps the rename-mid-session and
+                // resume-from-background paths through the single
+                // reconfigure(...) entry point.
+                senderPipeline?.reconfigure(streamName: output.effectiveStreamName,
+                                            groups: output.effectiveGroups)
             case .background:
                 senderPipeline?.stop()
             case .inactive:
@@ -126,9 +146,13 @@ struct ContentView: View {
         do {
             let compositor = try StereoCompositor(device: device)
             let senderPipeline = try SenderPipeline(device: device,
-                                                    commandQueue: queue,
-                                                    streamName: Self.defaultStreamName,
-                                                    groups: Self.defaultGroups)
+                                                    commandQueue: queue)
+            // First start uses the OutputStreamConfig defaults
+            // ("Stereo Preview" / "Public") via the same reconfigure
+            // path that the Settings sheet edit and scene-foreground
+            // transitions go through — one canonical entry point.
+            senderPipeline.reconfigure(streamName: output.effectiveStreamName,
+                                       groups: output.effectiveGroups)
             // The MetalPreviewView's Coordinator owns the per-tick
             // onTick closure and chains the SenderPipeline into it,
             // so we don't pre-set onTick here.
