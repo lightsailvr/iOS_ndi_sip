@@ -106,6 +106,13 @@ typedef NS_ENUM(NSInteger, NDIReceiverState) {
 @property (nonatomic, readonly) BOOL lastFrameInterlaced;
 @property (nonatomic, readonly) BOOL lastFrameHasAlpha;
 
+/// Source frame rate (frame_rate_N / frame_rate_D) as observed on the
+/// most recent successful capture. 0 until the first frame arrives.
+/// Read on any thread; backed by a single 64-bit atomic bitcast so the
+/// watchdog reads a consistent value without taking the lifecycle lock.
+/// Slice #13: surfaced on the per-eye StatusRow as "<W>×<H> @ <fps> fps".
+@property (nonatomic, readonly) double lastFrameRate;
+
 /// Main-thread callback fired on every state transition. The block is
 /// retained by the receiver; assign nil (or `nil` again) to detach.
 @property (nonatomic, copy, nullable) void (^onStateChange)(NDIReceiverState newState);

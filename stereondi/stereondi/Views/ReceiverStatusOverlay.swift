@@ -18,12 +18,28 @@
 //  The overlay sits in the same coordinate space as the preview's
 //  per-eye half. ContentView splits the preview area in two and
 //  mounts one of these on each half.
+//
+//  Slice #13 additions:
+//   - The `.empty` case becomes a tappable button that calls back
+//     into ContentView to present the SourcePickerSheet for that
+//     side. Composes cleanly with the EmptyState surface (which
+//     handles the both-sides-nil case): the per-half overlay covers
+//     "single-source partial preview" — one eye live, the other half
+//     showing "No source — tap to pick".
+//   - The "live" eye still renders no overlay (so a single live eye
+//     fills its half with the actual frame; the other half gets the
+//     tap-to-pick prompt).
 
 import SwiftUI
 
 struct ReceiverStatusOverlay: View {
     let side: Side
     let status: ReceiverWatchdog.SideStatus
+    /// Slice #13: invoked when the operator taps the `.empty` overlay
+    /// (single-source partial preview case). ContentView wires this
+    /// to set `pickerSide = .left` / `.right`. nil disables the tap
+    /// (the overlay still shows "No <side> source" text).
+    var onTapEmpty: (() -> Void)? = nil
 
     enum Side: Equatable {
         case left
@@ -58,14 +74,42 @@ struct ReceiverStatusOverlay: View {
                       text: "Stalled",
                       tint: .orange)
             case .empty:
-                badge(systemImage: "video.slash",
-                      spinner: false,
-                      text: "No \(side.label) source",
-                      tint: .secondary)
+                emptyOverlay
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityLabel(accessibilityLabel)
+    }
+
+    /// Single-source partial preview overlay: a tappable button that
+    /// covers the missing half. The whole half is hit-testable (per
+    /// the issue: "Place a button covering that half") so the
+    /// operator can tap anywhere in the dark side to surface the
+    /// picker. When `onTapEmpty` is nil the overlay is informational
+    /// only (the both-sides-nil path uses the dedicated EmptyState
+    /// surface, not this).
+    @ViewBuilder
+    private var emptyOverlay: some View {
+        if let onTapEmpty {
+            Button(action: onTapEmpty) {
+                ZStack {
+                    Color.black.opacity(0.001)
+                    badge(systemImage: "video.slash",
+                          spinner: false,
+                          text: "No \(side.label) source — tap to pick",
+                          tint: .secondary)
+                }
+            }
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+            .accessibilityLabel("Pick \(side.label) source")
+            .accessibilityHint("No source assigned to the \(side.label.lowercased()) eye. Tap to pick a source.")
+        } else {
+            badge(systemImage: "video.slash",
+                  spinner: false,
+                  text: "No \(side.label) source",
+                  tint: .secondary)
+        }
     }
 
     private var accessibilityLabel: String {

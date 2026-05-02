@@ -15,6 +15,12 @@
 //
 //   - Double-tap → reset zoomScale to 1.0.
 //
+//   - Slice #13: optional `onSingleTap` — invoked on a single-finger
+//     tap. ContentView wires this to bump the chrome-visibility
+//     timer (auto-hide-after-3s, PRD user story 23). A two-finger
+//     drag does NOT call this — alignment sessions want hidden
+//     chrome (issue sanity-check section).
+//
 //  The two-finger drag is implemented with a UIKit
 //  UIPanGestureRecognizer (`minimum/maximumNumberOfTouches = 2`)
 //  bridged via UIViewRepresentable, because SwiftUI's DragGesture
@@ -31,6 +37,10 @@ import UIKit
 struct PreviewGestureOverlay: View {
     let alignment: AlignmentState
     @Binding var zoom: CGFloat
+    /// Slice #13: invoked on a single-finger tap on the preview area.
+    /// ContentView uses this to bump the chrome-visibility timer.
+    /// Two-finger drag does NOT call this — see file header.
+    var onSingleTap: (() -> Void)? = nil
 
     private static let minZoom: CGFloat = 1.0
     private static let maxZoom: CGFloat = 2.0
@@ -43,10 +53,16 @@ struct PreviewGestureOverlay: View {
         // Color.clear with contentShape gives the SwiftUI gestures a
         // hit-testable surface across the full overlay rect. The
         // UIKit two-finger pan lives in the overlay() above it.
+        //
+        // Order matters: the double-tap gesture is registered before
+        // the single-tap, so a double-tap doesn't ALSO fire the
+        // single-tap chrome bump (TapGesture(count:1) loses its
+        // exclusivity to count:2 when both are present).
         Color.clear
             .contentShape(Rectangle())
             .gesture(magnification)
             .gesture(doubleTap)
+            .gesture(singleTap)
             .overlay(
                 TwoFingerPanGesture(alignment: alignment,
                                     pixelsPerPoint: Self.convergencePxPerDragPoint)
@@ -67,6 +83,19 @@ struct PreviewGestureOverlay: View {
                 if zoom != Self.minZoom {
                     zoom = Self.minZoom
                 }
+            }
+    }
+
+    /// Single-tap → bump the chrome-visibility timer in ContentView.
+    /// `.exclusively(before: doubleTap)` would be the textbook chain
+    /// but SwiftUI's TapGesture(count:2) already takes precedence
+    /// over count:1 when both are attached via `.gesture(...)`, so
+    /// the single-tap callback only fires after the double-tap window
+    /// has elapsed without a second tap.
+    private var singleTap: some Gesture {
+        TapGesture(count: 1)
+            .onEnded {
+                onSingleTap?()
             }
     }
 }

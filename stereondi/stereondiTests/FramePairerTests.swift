@@ -394,6 +394,7 @@ private final class ScriptableWatchableReceiver: WatchableReceiver, @unchecked S
     var lastFrameHeight: Int = 0
     var lastFrameInterlaced: Bool = false
     var lastFrameHasAlpha: Bool = false
+    var lastFrameRate: Double = 0
     private(set) var kickCount: Int = 0
 
     func kickReconnect() {
