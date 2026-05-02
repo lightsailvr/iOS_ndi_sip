@@ -1,68 +1,84 @@
 //  MetalPreviewView.swift
 //
-//  SwiftUI wrapper around an MTKView that pulls frames from an NDIReceiver
-//  at the iPad's vsync cadence and renders them via Core Image. Slice #2
-//  intentionally uses Core Image — slice #4 replaces this stage with a
-//  hand-rolled Metal compositor that samples UYVY directly. Until then
-//  Core Image gives us aspect-fit, color-space-correct UYVY/BGRA output
-//  for free.
+//  SwiftUI wrapper around an MTKView that renders the stereo SbS
+//  composite of a FramePairer's latest pair via the StereoCompositor.
 //
-//  MTKView dispatches its delegate callbacks on the main thread by
-//  default. NDIReceiver.latestFrame is documented thread-safe so the
-//  cross-thread guarantees this would need anyway are already in place.
+//  Wire-up: the FramePairer drives a CADisplayLink that ticks on main
+//  and (a) caches the latest StereoFramePair on this Coordinator,
+//  (b) marks the MTKView as needing display. The MTKView's draw(in:)
+//  callback is the only place compositor.render() runs, so the Metal
+//  command buffer's submission cadence and the pairer's pull cadence
+//  are always in lockstep.
+//
+//  Slice #2's CIContext-based rendering is gone — every pixel from
+//  here on is drawn by the StereoCompositor's shader pipelines.
 
-import CoreImage
 import Metal
 import MetalKit
+import QuartzCore
 import SwiftUI
 
 struct MetalPreviewView: UIViewRepresentable {
-    let receiver: NDIReceiver
+    let pairer: FramePairer
+    let compositor: StereoCompositor
+    let device: MTLDevice
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(receiver: receiver)
+        Coordinator(compositor: compositor, device: device)
     }
 
     func makeUIView(context: Context) -> MTKView {
         let view = MTKView()
-        view.device = context.coordinator.metalDevice
+        view.device = device
         view.colorPixelFormat = .bgra8Unorm
         view.framebufferOnly = false
         view.preferredFramesPerSecond = 0
-        view.isPaused = false
-        view.enableSetNeedsDisplay = false
+        // Display-link-driven by the FramePairer's tick rather than the
+        // MTKView's own internal display link.
+        view.isPaused = true
+        view.enableSetNeedsDisplay = true
         view.autoResizeDrawable = true
         view.clearColor = MTLClearColorMake(0, 0, 0, 1)
         view.delegate = context.coordinator
+
+        context.coordinator.attach(to: view, pairer: pairer)
         return view
     }
 
     func updateUIView(_ uiView: MTKView, context: Context) {
-        context.coordinator.receiver = receiver
+        context.coordinator.attach(to: uiView, pairer: pairer)
     }
 
+    @MainActor
     final class Coordinator: NSObject, MTKViewDelegate {
-        let metalDevice: MTLDevice
+        let device: MTLDevice
+        var compositor: StereoCompositor
         private let commandQueue: MTLCommandQueue
-        private let ciContext: CIContext
-        var receiver: NDIReceiver
+        private weak var view: MTKView?
+        private var latestPair: StereoFramePair = StereoFramePair(left: nil, right: nil, hostTime: 0)
 
-        init(receiver: NDIReceiver) {
-            self.receiver = receiver
-            guard let device = MTLCreateSystemDefaultDevice(),
-                  let queue = device.makeCommandQueue() else {
-                fatalError("Metal is unavailable on this device")
+        init(compositor: StereoCompositor, device: MTLDevice) {
+            self.compositor = compositor
+            self.device = device
+            guard let queue = device.makeCommandQueue() else {
+                fatalError("Failed to create Metal command queue")
             }
-            self.metalDevice = device
             self.commandQueue = queue
-            self.ciContext = CIContext(
-                mtlCommandQueue: queue,
-                options: [
-                    .workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB) as Any,
-                    .cacheIntermediates: false,
-                ]
-            )
             super.init()
+        }
+
+        func attach(to view: MTKView, pairer: FramePairer) {
+            self.view = view
+            // Replace the pairer's tick handler with one bound to this
+            // Coordinator so the latest pair is always cached here and
+            // the MTKView is asked to redraw exactly when the pairer
+            // ticks. updateUIView re-runs this on every SwiftUI update,
+            // which is safe — the assignment is just a closure swap.
+            pairer.onTick = { [weak self] pair in
+                guard let self else { return }
+                self.latestPair = pair
+                self.view?.setNeedsDisplay()
+            }
         }
 
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -73,54 +89,12 @@ struct MetalPreviewView: UIViewRepresentable {
                 return
             }
 
-            let drawableSize = view.drawableSize
-            let texture = drawable.texture
-
-            if let renderPass = view.currentRenderPassDescriptor {
-                renderPass.colorAttachments[0].loadAction = .clear
-                renderPass.colorAttachments[0].clearColor = view.clearColor
-                if let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) {
-                    encoder.endEncoding()
-                }
-            }
-
-            if let frame = receiver.latestFrame() {
-                let pixelBuffer = frame.pixelBuffer
-                let sourceImage = CIImage(cvPixelBuffer: pixelBuffer)
-                let fitted = aspectFit(sourceImage,
-                                       sourceSize: CGSize(width: frame.width, height: frame.height),
-                                       into: drawableSize)
-                let destination = CIRenderDestination(
-                    width: Int(drawableSize.width),
-                    height: Int(drawableSize.height),
-                    pixelFormat: view.colorPixelFormat,
-                    commandBuffer: commandBuffer,
-                    mtlTextureProvider: { texture }
-                )
-                destination.isFlipped = false
-                _ = try? ciContext.startTask(toRender: fitted, to: destination)
-            }
+            compositor.render(pair: latestPair,
+                              into: drawable.texture,
+                              commandBuffer: commandBuffer)
 
             commandBuffer.present(drawable)
             commandBuffer.commit()
-        }
-
-        private func aspectFit(_ image: CIImage,
-                               sourceSize: CGSize,
-                               into target: CGSize) -> CIImage {
-            guard sourceSize.width > 0,
-                  sourceSize.height > 0,
-                  target.width > 0,
-                  target.height > 0 else {
-                return image
-            }
-            let scale = min(target.width / sourceSize.width,
-                            target.height / sourceSize.height)
-            let scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-            let scaledExtent = scaled.extent
-            let dx = (target.width - scaledExtent.width) / 2.0 - scaledExtent.origin.x
-            let dy = (target.height - scaledExtent.height) / 2.0 - scaledExtent.origin.y
-            return scaled.transformed(by: CGAffineTransform(translationX: dx, y: dy))
         }
     }
 }
