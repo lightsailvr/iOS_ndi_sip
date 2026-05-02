@@ -1,16 +1,27 @@
 //  StereoCompositor.swift
 //
-//  Stereo SbS compositor. Each per-eye draw call covers an aspect-fit
-//  half of the target with a triangle strip; the fragment shader maps
-//  destination UV ∈ [0,1] into the auto-crop "common region" of source
-//  UV ∈ [0,1]. The hardware bilinear filter on the source sampler
-//  delivers sub-pixel sampling for free, which is how HIT achieves its
-//  0.1 px specified resolution.
+//  Stereo compositor with split screen and sender pipelines (slice #8).
+//  Shared upstream: per-eye CVMetalTexture cache lookup +
+//  AlignmentMath uniform calculation. Two final-stage entry points
+//  diverge from there:
+//   - `renderScreen(...)` honors `alignment.screenMode` and dispatches
+//     to the SbS, anaglyph, or channel-test draw path.
+//   - `renderForSender(...)` is hard-wired to SbS regardless of
+//     screenMode so the Quest viewer's stream stays uninterrupted
+//     while the operator iterates between alignment views.
 //
-//  Two pipelines because UYVY and BGRA need different fragment shaders
-//  (UYVY samples through the bgrg422-format hardware chroma upsampler
-//  and decodes BT.709 limited-range in-shader). Pipeline selection is
-//  per-side; the operator can mix BGRA and UYVY sources for free.
+//  SbS draws each eye as an aspect-fit half via a per-side triangle
+//  strip; the fragment shader maps destination UV ∈ [0,1] into the
+//  HIT-translated source-UV window the CPU computed via
+//  AlignmentMath.uvWindow. The hardware bilinear filter on the source
+//  sampler delivers sub-pixel sampling for free, which is how HIT
+//  achieves its 0.1 px specified resolution.
+//
+//  Anaglyph draws a single full-frame quad and samples both sources
+//  in one fragment invocation via per-side AnaglyphSideUniforms (the
+//  `decodeMode` field selects BGRA vs UYVY decode per side, so a
+//  single anaglyph pipeline covers all source-format permutations).
+//  Channel-test draws a full-frame quad and bypasses sources entirely.
 //
 //  Slice #6 additions:
 //   - `AlignmentUniforms` carries (u_min, u_max) per side. The shader
@@ -34,9 +45,23 @@
 //     work (anaglyph mode-specific behavior, telemetry overlays) can
 //     read the active mode without an extra binding.
 //
-//  The MTLTexture handed to render() is owned by the caller (typically
-//  an MTKView's currentDrawable). We do not present or commit; the
-//  caller does.
+//  Slice #8 split: there are now two final-stage render entry points
+//  sharing the upstream per-eye CVMetalTexture cache + alignment
+//  uniform calculation:
+//   - `renderScreen(...)` honors `alignment.screenMode` (.sbs /
+//     .anaglyph / .channelTest). The iPad operator's preview.
+//   - `renderForSender(...)` is always SbS regardless of
+//     `screenMode`. The Quest viewer's stream is uninterrupted.
+//  The legacy `render(...)` is preserved as a wrapper that calls
+//  `renderScreen(...)` so any external caller still compiles. The
+//  pipeline cache now keys on `(SourceKind, Mode, target pixelFormat)`
+//  so the .sbs / .anaglyph / .channelTest pipelines coexist for both
+//  the MTKView's `.bgra8Unorm` drawable and the test target's
+//  offscreen render target.
+//
+//  The MTLTexture handed to renderScreen() is owned by the caller
+//  (typically an MTKView's currentDrawable). We do not present or
+//  commit; the caller does.
 
 import CoreVideo
 import Foundation
@@ -72,17 +97,44 @@ final class StereoCompositor {
         var padding: Float = 0
     }
 
+    /// Per-side payload for the anaglyph fragment shader. Layout MUST
+    /// stay in sync with `AnaglyphSideUniforms` in `Compositor.metal`.
+    /// `decodeMode` is 0 for BGRA sources, 1 for UYVY (.bgrg422). The
+    /// destination subrect is in full-frame UV space (origin top-left,
+    /// (0,0) → (1,1)) and identifies where this source's aspect-fit
+    /// lives within the full anaglyph output.
+    struct AnaglyphSideUniforms: Sendable {
+        var dstUVxMin: Float
+        var dstUVxMax: Float
+        var dstUVyMin: Float
+        var dstUVyMax: Float
+        var uMin: Float
+        var uMax: Float
+        var decodeMode: UInt32
+        var padding: UInt32 = 0
+    }
+
+    struct AnaglyphUniforms: Sendable {
+        var redSide: AnaglyphSideUniforms
+        var cyanSide: AnaglyphSideUniforms
+    }
+
     private let device: MTLDevice
     private let vertexFunction: MTLFunction
+    private let fullFrameVertex: MTLFunction
     private let fragmentBGRA: MTLFunction
     private let fragmentUYVY: MTLFunction
+    private let fragmentAnaglyph: MTLFunction
+    private let fragmentChannelTest: MTLFunction
     private let vertexDescriptor: MTLVertexDescriptor
     private let textureCache: CVMetalTextureCache
 
-    // (sourceKind, targetPixelFormat) → pipeline. Built lazily so the
-    // compositor adapts to both .bgra8Unorm (MTKView default) and
+    // (sourceKind, mode, targetPixelFormat) → pipeline. Built lazily so
+    // the compositor adapts to both .bgra8Unorm (MTKView default) and
     // .bgra8Unorm_srgb (golden-image test target) without the caller
-    // having to pre-declare which.
+    // having to pre-declare which. Slice #8 adds Mode (.sbs / .anaglyph
+    // / .channelTest) so the screen pipeline can carry all three
+    // simultaneously while the sender's .sbs entry remains unchanged.
     private var pipelineCache: [PipelineKey: MTLRenderPipelineState] = [:]
 
     // Lazily-allocated 1920×1080 .bgra8Unorm offscreen render target
@@ -99,8 +151,11 @@ final class StereoCompositor {
         }
 
         self.vertexFunction = try Self.loadFunction(library: library, name: "sbs_vertex")
+        self.fullFrameVertex = try Self.loadFunction(library: library, name: "fullframe_vertex")
         self.fragmentBGRA = try Self.loadFunction(library: library, name: "sbs_fragment_bgra")
         self.fragmentUYVY = try Self.loadFunction(library: library, name: "sbs_fragment_uyvy")
+        self.fragmentAnaglyph = try Self.loadFunction(library: library, name: "fragment_anaglyph")
+        self.fragmentChannelTest = try Self.loadFunction(library: library, name: "fragment_channeltest")
         self.vertexDescriptor = Self.makeVertexDescriptor()
 
         var cache: CVMetalTextureCache?
@@ -111,18 +166,67 @@ final class StereoCompositor {
         self.textureCache = cache
     }
 
-    /// Render the SbS composite of `pair` into `target`, using `alignment`
-    /// for per-eye HIT + auto-crop. The target's loadAction is .clear
-    /// (black); a nil pair (or nil eye) draws no geometry for that
-    /// half so the cleared black shows through.
+    /// Render the iPad screen composite of `pair` into `target` using
+    /// `alignment` for per-eye HIT + crop and `alignment.screenMode`
+    /// for the final stage (.sbs / .anaglyph / .channelTest). The
+    /// target's loadAction is .clear (black); a nil pair (or nil eye)
+    /// in SbS draws no geometry for that half so the cleared black
+    /// shows through. In anaglyph, a missing source contributes 0 to
+    /// its channel(s); channel-test bypasses sources entirely.
     ///
-    /// `alignment` is read fresh per call — the compositor never caches
-    /// values from prior frames, so a slider drag or a two-finger pan
-    /// reflects in the very next rendered frame.
+    /// `alignment` is read fresh per call — the compositor never
+    /// caches values from prior frames, so a slider drag or a
+    /// two-finger pan reflects in the very next rendered frame.
+    func renderScreen(pair: StereoFramePair,
+                      alignment: AlignmentState,
+                      into target: MTLTexture,
+                      commandBuffer: MTLCommandBuffer) {
+        switch alignment.screenMode {
+        case .sbs:
+            renderSbS(pair: pair, alignment: alignment, into: target, commandBuffer: commandBuffer)
+        case .anaglyph:
+            renderAnaglyph(pair: pair, alignment: alignment, into: target, commandBuffer: commandBuffer)
+        case .channelTest:
+            renderChannelTest(into: target, commandBuffer: commandBuffer)
+        }
+    }
+
+    /// Backwards-compat wrapper for callers written before the slice-#8
+    /// split. Routes through `renderScreen(...)` so external behavior is
+    /// preserved (the wrapper honors `alignment.screenMode`).
+    @available(*, deprecated, renamed: "renderScreen(pair:alignment:into:commandBuffer:)")
     func render(pair: StereoFramePair,
                 alignment: AlignmentState,
                 into target: MTLTexture,
                 commandBuffer: MTLCommandBuffer) {
+        renderScreen(pair: pair, alignment: alignment, into: target, commandBuffer: commandBuffer)
+    }
+
+    /// Render the SbS composite of `pair` into the compositor's owned
+    /// 1920×1080 offscreen BGRA target and return that texture. ALWAYS
+    /// SbS regardless of `alignment.screenMode` — the NDI-output
+    /// pipeline is mode-agnostic so the Quest viewer's stream stays
+    /// uninterrupted while the operator iterates between alignment
+    /// views (PRD user story 17 + 30). The caller appends a
+    /// UYVY-encode compute pass on the same command buffer and reads
+    /// the result back via a completion handler. Returns nil if the
+    /// offscreen target couldn't be allocated.
+    func renderForSender(pair: StereoFramePair,
+                         alignment: AlignmentState,
+                         commandBuffer: MTLCommandBuffer) -> MTLTexture? {
+        guard let target = ensureSenderTarget() else {
+            return nil
+        }
+        renderSbS(pair: pair, alignment: alignment, into: target, commandBuffer: commandBuffer)
+        return target
+    }
+
+    // MARK: - Mode dispatch
+
+    private func renderSbS(pair: StereoFramePair,
+                           alignment: AlignmentState,
+                           into target: MTLTexture,
+                           commandBuffer: MTLCommandBuffer) {
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = target
         pass.colorAttachments[0].loadAction = .clear
@@ -149,30 +253,30 @@ final class StereoCompositor {
         var inflight: [CVMetalTexture] = []
 
         if let leftFrame = pair.left,
-           let drawn = drawSide(encoder: encoder,
-                                frame: leftFrame,
-                                side: .left,
-                                hitPixels: leftHIT,
-                                otherHitPixels: rightHIT,
-                                otherFrameWidth: pair.right?.width,
-                                cropMode: cropMode,
-                                targetWidth: target.width,
-                                targetHeight: target.height,
-                                targetPixelFormat: target.pixelFormat) {
+           let drawn = drawSbSSide(encoder: encoder,
+                                   frame: leftFrame,
+                                   side: .left,
+                                   hitPixels: leftHIT,
+                                   otherHitPixels: rightHIT,
+                                   otherFrameWidth: pair.right?.width,
+                                   cropMode: cropMode,
+                                   targetWidth: target.width,
+                                   targetHeight: target.height,
+                                   targetPixelFormat: target.pixelFormat) {
             inflight.append(drawn)
         }
 
         if let rightFrame = pair.right,
-           let drawn = drawSide(encoder: encoder,
-                                frame: rightFrame,
-                                side: .right,
-                                hitPixels: rightHIT,
-                                otherHitPixels: leftHIT,
-                                otherFrameWidth: pair.left?.width,
-                                cropMode: cropMode,
-                                targetWidth: target.width,
-                                targetHeight: target.height,
-                                targetPixelFormat: target.pixelFormat) {
+           let drawn = drawSbSSide(encoder: encoder,
+                                   frame: rightFrame,
+                                   side: .right,
+                                   hitPixels: rightHIT,
+                                   otherHitPixels: leftHIT,
+                                   otherFrameWidth: pair.left?.width,
+                                   cropMode: cropMode,
+                                   targetWidth: target.width,
+                                   targetHeight: target.height,
+                                   targetPixelFormat: target.pixelFormat) {
             inflight.append(drawn)
         }
 
@@ -185,19 +289,141 @@ final class StereoCompositor {
         }
     }
 
-    /// Render the SbS composite of `pair` into the compositor's owned
-    /// 1920×1080 offscreen BGRA target and return that texture. The
-    /// caller appends a UYVY-encode compute pass on the same command
-    /// buffer and reads the result back via a completion handler.
-    /// Returns nil if the offscreen target couldn't be allocated.
-    func renderForSender(pair: StereoFramePair,
-                         alignment: AlignmentState,
-                         commandBuffer: MTLCommandBuffer) -> MTLTexture? {
-        guard let target = ensureSenderTarget() else {
-            return nil
+    private func renderAnaglyph(pair: StereoFramePair,
+                                alignment: AlignmentState,
+                                into target: MTLTexture,
+                                commandBuffer: MTLCommandBuffer) {
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = target
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        pass.colorAttachments[0].storeAction = .store
+
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+            return
         }
-        render(pair: pair, alignment: alignment, into: target, commandBuffer: commandBuffer)
-        return target
+
+        let leftHIT = alignment.leftHIT
+        let rightHIT = alignment.rightHIT
+        let cropMode = alignment.cropMode
+        let swap = alignment.swapEyes
+
+        // Resolve the per-eye sampled textures. If a source is missing
+        // we still need a valid texture binding for the shader, so we
+        // fall back to the "other" eye's resolved texture and mark its
+        // destination subrect as empty (uMin == uMax, dst zero-area)
+        // so its sample contribution is 0.
+        let resolvedLeft = pair.left.flatMap { resolveSource($0) }
+        let resolvedRight = pair.right.flatMap { resolveSource($0) }
+
+        guard resolvedLeft != nil || resolvedRight != nil else {
+            encoder.endEncoding()
+            return
+        }
+
+        // The two source slots in the anaglyph shader are: red_source
+        // (luma → red), cyan_source (luma → green+blue). Default
+        // mapping is left → red, right → cyan; swap-eyes inverts.
+        let redResolved   = swap ? resolvedRight : resolvedLeft
+        let redHIT        = swap ? rightHIT : leftHIT
+        let redOtherHIT   = swap ? leftHIT : rightHIT
+        let redOtherWidth = swap ? pair.left?.width : pair.right?.width
+
+        let cyanResolved   = swap ? resolvedLeft : resolvedRight
+        let cyanHIT        = swap ? leftHIT : rightHIT
+        let cyanOtherHIT   = swap ? rightHIT : leftHIT
+        let cyanOtherWidth = swap ? pair.right?.width : pair.left?.width
+
+        let redSide = anaglyphSideUniforms(resolved: redResolved,
+                                           hit: redHIT,
+                                           otherHit: redOtherHIT,
+                                           otherWidth: redOtherWidth,
+                                           cropMode: cropMode,
+                                           targetWidth: target.width,
+                                           targetHeight: target.height,
+                                           side: .left)
+        let cyanSide = anaglyphSideUniforms(resolved: cyanResolved,
+                                            hit: cyanHIT,
+                                            otherHit: cyanOtherHIT,
+                                            otherWidth: cyanOtherWidth,
+                                            cropMode: cropMode,
+                                            targetWidth: target.width,
+                                            targetHeight: target.height,
+                                            side: .right)
+
+        guard let pipelineState = pipeline(for: nil,
+                                           mode: .anaglyph,
+                                           targetPixelFormat: target.pixelFormat) else {
+            encoder.endEncoding()
+            return
+        }
+
+        // Both texture slots must be bound — the shader samples both
+        // unconditionally. If one source is missing we bind the other
+        // resolved texture into both slots; the missing side's
+        // dst-subrect is zero-area so its luma contribution is 0.
+        let redTexture: MTLTexture? = redResolved?.texture ?? cyanResolved?.texture
+        let cyanTexture: MTLTexture? = cyanResolved?.texture ?? redResolved?.texture
+        guard let redTexture, let cyanTexture else {
+            encoder.endEncoding()
+            return
+        }
+
+        var verts = Self.fullFrameQuadVertices()
+        var uniforms = AnaglyphUniforms(redSide: redSide, cyanSide: cyanSide)
+
+        encoder.setRenderPipelineState(pipelineState)
+        encoder.setVertexBytes(&verts,
+                               length: MemoryLayout<SbSVertex>.stride * verts.count,
+                               index: 0)
+        encoder.setFragmentBytes(&uniforms,
+                                 length: MemoryLayout<AnaglyphUniforms>.stride,
+                                 index: 0)
+        encoder.setFragmentTexture(redTexture, index: 0)
+        encoder.setFragmentTexture(cyanTexture, index: 1)
+        encoder.drawPrimitives(type: .triangleStrip,
+                               vertexStart: 0,
+                               vertexCount: verts.count)
+        encoder.endEncoding()
+
+        var inflight: [CVMetalTexture] = []
+        if let cv = redResolved?.cvTexture { inflight.append(cv) }
+        if let cv = cyanResolved?.cvTexture { inflight.append(cv) }
+        if !inflight.isEmpty {
+            commandBuffer.addCompletedHandler { _ in
+                _ = inflight
+            }
+        }
+    }
+
+    private func renderChannelTest(into target: MTLTexture,
+                                   commandBuffer: MTLCommandBuffer) {
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = target
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        pass.colorAttachments[0].storeAction = .store
+
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+            return
+        }
+
+        guard let pipelineState = pipeline(for: nil,
+                                           mode: .channelTest,
+                                           targetPixelFormat: target.pixelFormat) else {
+            encoder.endEncoding()
+            return
+        }
+
+        var verts = Self.fullFrameQuadVertices()
+        encoder.setRenderPipelineState(pipelineState)
+        encoder.setVertexBytes(&verts,
+                               length: MemoryLayout<SbSVertex>.stride * verts.count,
+                               index: 0)
+        encoder.drawPrimitives(type: .triangleStrip,
+                               vertexStart: 0,
+                               vertexCount: verts.count)
+        encoder.endEncoding()
     }
 
     private func ensureSenderTarget() -> MTLTexture? {
@@ -265,16 +491,118 @@ final class StereoCompositor {
     }
 
     @discardableResult
-    private func drawSide(encoder: MTLRenderCommandEncoder,
-                          frame: any VideoFrameSource,
-                          side: Side,
-                          hitPixels: Double,
-                          otherHitPixels: Double,
-                          otherFrameWidth: Int?,
-                          cropMode: CropMode,
-                          targetWidth: Int,
-                          targetHeight: Int,
-                          targetPixelFormat: MTLPixelFormat) -> CVMetalTexture? {
+    private func drawSbSSide(encoder: MTLRenderCommandEncoder,
+                             frame: any VideoFrameSource,
+                             side: Side,
+                             hitPixels: Double,
+                             otherHitPixels: Double,
+                             otherFrameWidth: Int?,
+                             cropMode: CropMode,
+                             targetWidth: Int,
+                             targetHeight: Int,
+                             targetPixelFormat: MTLPixelFormat) -> CVMetalTexture? {
+        guard let resolved = resolveSource(frame) else {
+            return nil
+        }
+        guard let pipelineState = pipeline(for: resolved.sourceKind,
+                                           mode: .sbs,
+                                           targetPixelFormat: targetPixelFormat) else {
+            return nil
+        }
+
+        let rect = Self.aspectFitNDCRect(srcWidth: frame.width,
+                                         srcHeight: frame.height,
+                                         targetWidth: targetWidth,
+                                         targetHeight: targetHeight,
+                                         side: side)
+        var verts = Self.quadVertices(for: rect)
+
+        var uniforms = Self.alignmentUniforms(forSideHITPixels: hitPixels,
+                                              otherSideHITPixels: otherHitPixels,
+                                              sourceWidthPixels: frame.width,
+                                              otherSourceWidthPixels: otherFrameWidth,
+                                              cropMode: cropMode)
+
+        encoder.setRenderPipelineState(pipelineState)
+        encoder.setVertexBytes(&verts,
+                               length: MemoryLayout<SbSVertex>.stride * verts.count,
+                               index: 0)
+        encoder.setFragmentBytes(&uniforms,
+                                 length: MemoryLayout<AlignmentUniforms>.stride,
+                                 index: 0)
+        encoder.setFragmentTexture(resolved.texture, index: 0)
+        encoder.drawPrimitives(type: .triangleStrip,
+                               vertexStart: 0,
+                               vertexCount: verts.count)
+        return resolved.cvTexture
+    }
+
+    /// Per-eye anaglyph uniforms. The destination subrect is the same
+    /// aspect-fit subrect SbS uses for that side, but expressed in
+    /// full-frame UV (origin top-left) so a single full-frame quad can
+    /// cover the output. The (uMin, uMax) sampling window matches the
+    /// SbS path's HIT/crop math exactly so anaglyph and SbS share the
+    /// same sub-pixel HIT correctness.
+    ///
+    /// `resolved == nil` (single-source case) returns a zero-area
+    /// destination subrect so the shader's bounds check zeroes out
+    /// this side's luma contribution.
+    private func anaglyphSideUniforms(resolved: ResolvedSource?,
+                                      hit: Double,
+                                      otherHit: Double,
+                                      otherWidth: Int?,
+                                      cropMode: CropMode,
+                                      targetWidth: Int,
+                                      targetHeight: Int,
+                                      side: Side) -> AnaglyphSideUniforms {
+        guard let resolved else {
+            return AnaglyphSideUniforms(dstUVxMin: 0, dstUVxMax: 0,
+                                        dstUVyMin: 0, dstUVyMax: 0,
+                                        uMin: 0, uMax: 0,
+                                        decodeMode: 0)
+        }
+
+        let alignmentU = Self.alignmentUniforms(forSideHITPixels: hit,
+                                                otherSideHITPixels: otherHit,
+                                                sourceWidthPixels: resolved.width,
+                                                otherSourceWidthPixels: otherWidth,
+                                                cropMode: cropMode)
+
+        // Anaglyph outputs over the FULL frame, not split halves, so
+        // the destination is the entire output rect (UV 0..1) — but
+        // we still aspect-fit the source within that full rect so a
+        // 16:9 source on a 16:9 target fills it edge-to-edge, while a
+        // 4:3 source pillar-boxes. (PRD: "matching the existing
+        // aspect-fit math you'd otherwise apply to a half — but here
+        // both sources fill the same full output rect.")
+        let subrect = Self.aspectFitFullFrameUVRect(srcWidth: resolved.width,
+                                                    srcHeight: resolved.height,
+                                                    targetWidth: targetWidth,
+                                                    targetHeight: targetHeight)
+        _ = side
+        let decode: UInt32 = (resolved.sourceKind == .uyvy) ? 1 : 0
+        return AnaglyphSideUniforms(dstUVxMin: subrect.xMin,
+                                    dstUVxMax: subrect.xMax,
+                                    dstUVyMin: subrect.yMin,
+                                    dstUVyMax: subrect.yMax,
+                                    uMin: alignmentU.uMin,
+                                    uMax: alignmentU.uMax,
+                                    decodeMode: decode)
+    }
+
+    /// Per-frame source resolution: CVPixelBuffer → MTLTexture via
+    /// the cache, plus the source-kind tag the pipeline cache keys on.
+    /// Returned together so the SbS and anaglyph paths share one
+    /// resolution path.
+    private struct ResolvedSource {
+        let cvTexture: CVMetalTexture
+        let texture: MTLTexture
+        let sourceKind: SourceKind
+        let width: Int
+        let height: Int
+    }
+
+    private func resolveSource(_ frame: any VideoFrameSource) -> ResolvedSource? {
         let pixelBuffer = frame.pixelBuffer
         let formatType = CVPixelBufferGetPixelFormatType(pixelBuffer)
 
@@ -304,63 +632,69 @@ final class StereoCompositor {
             return nil
         }
 
-        guard let metalTexture = CVMetalTextureGetTexture(cvTexture),
-              let pipelineState = pipeline(for: sourceKind, targetPixelFormat: targetPixelFormat) else {
+        guard let metalTexture = CVMetalTextureGetTexture(cvTexture) else {
             return nil
         }
-
-        let rect = Self.aspectFitNDCRect(srcWidth: frame.width,
-                                         srcHeight: frame.height,
-                                         targetWidth: targetWidth,
-                                         targetHeight: targetHeight,
-                                         side: side)
-        var verts = Self.quadVertices(for: rect)
-
-        var uniforms = Self.alignmentUniforms(forSideHITPixels: hitPixels,
-                                              otherSideHITPixels: otherHitPixels,
-                                              sourceWidthPixels: frame.width,
-                                              otherSourceWidthPixels: otherFrameWidth,
-                                              cropMode: cropMode)
-
-        encoder.setRenderPipelineState(pipelineState)
-        encoder.setVertexBytes(&verts,
-                               length: MemoryLayout<SbSVertex>.stride * verts.count,
-                               index: 0)
-        encoder.setFragmentBytes(&uniforms,
-                                 length: MemoryLayout<AlignmentUniforms>.stride,
-                                 index: 0)
-        encoder.setFragmentTexture(metalTexture, index: 0)
-        encoder.drawPrimitives(type: .triangleStrip,
-                               vertexStart: 0,
-                               vertexCount: verts.count)
-        return cvTexture
+        return ResolvedSource(cvTexture: cvTexture,
+                              texture: metalTexture,
+                              sourceKind: sourceKind,
+                              width: frame.width,
+                              height: frame.height)
     }
 
-    private enum SourceKind {
+    private enum SourceKind: Hashable {
         case bgra
         case uyvy
     }
 
+    /// Final-stage compositor mode. Drives both pipeline-cache keying
+    /// and the dispatch in `renderScreen(...)`. The sender pipeline
+    /// is hard-wired to `.sbs` and never sees the others.
+    enum Mode: Hashable {
+        case sbs
+        case anaglyph
+        case channelTest
+    }
+
+    /// `sourceKind` is `nil` for modes that don't sample a textured
+    /// source (`.anaglyph`'s shader is the same regardless of the two
+    /// sources' formats — decode is per-side via the uniform's
+    /// `decodeMode` field; `.channelTest` doesn't sample at all).
     private struct PipelineKey: Hashable {
-        let sourceKind: SourceKind
+        let sourceKind: SourceKind?
+        let mode: Mode
         let targetFormatRaw: UInt
     }
 
-    private func pipeline(for sourceKind: SourceKind,
+    private func pipeline(for sourceKind: SourceKind?,
+                          mode: Mode,
                           targetPixelFormat: MTLPixelFormat) -> MTLRenderPipelineState? {
         let key = PipelineKey(sourceKind: sourceKind,
+                              mode: mode,
                               targetFormatRaw: targetPixelFormat.rawValue)
         if let cached = pipelineCache[key] {
             return cached
         }
+        let vertex: MTLFunction
         let fragment: MTLFunction
-        switch sourceKind {
-        case .bgra: fragment = fragmentBGRA
-        case .uyvy: fragment = fragmentUYVY
+        switch mode {
+        case .sbs:
+            vertex = vertexFunction
+            switch sourceKind {
+            case .bgra: fragment = fragmentBGRA
+            case .uyvy: fragment = fragmentUYVY
+            case .none: return nil
+            }
+        case .anaglyph:
+            vertex = fullFrameVertex
+            fragment = fragmentAnaglyph
+        case .channelTest:
+            vertex = fullFrameVertex
+            fragment = fragmentChannelTest
         }
         do {
             let pipeline = try Self.makePipeline(device: device,
-                                                 vertex: vertexFunction,
+                                                 vertex: vertex,
                                                  fragment: fragment,
                                                  vertexDescriptor: vertexDescriptor,
                                                  targetPixelFormat: targetPixelFormat)
@@ -456,6 +790,49 @@ final class StereoCompositor {
             SbSVertex(position: SIMD2(rect.xMax, rect.yMax), uv: SIMD2(1, 0)),
             SbSVertex(position: SIMD2(rect.xMax, rect.yMin), uv: SIMD2(1, 1)),
         ]
+    }
+
+    /// Full-frame triangle-strip quad covering NDC (-1,-1)→(+1,+1)
+    /// with UV (0,0)→(1,1). Used by anaglyph and channel-test (single
+    /// draw call covering the full output).
+    fileprivate static func fullFrameQuadVertices() -> [SbSVertex] {
+        return [
+            SbSVertex(position: SIMD2(-1,  1), uv: SIMD2(0, 0)),
+            SbSVertex(position: SIMD2(-1, -1), uv: SIMD2(0, 1)),
+            SbSVertex(position: SIMD2( 1,  1), uv: SIMD2(1, 0)),
+            SbSVertex(position: SIMD2( 1, -1), uv: SIMD2(1, 1)),
+        ]
+    }
+
+    /// Aspect-fit subrect in full-frame UV space (0..1, top-left
+    /// origin) for a single source filling the FULL output rect (not
+    /// a side-by-side half). Anaglyph uses this so a 16:9 source on a
+    /// 16:9 target fills edge-to-edge while a 4:3 source pillar-boxes.
+    fileprivate static func aspectFitFullFrameUVRect(srcWidth: Int,
+                                                     srcHeight: Int,
+                                                     targetWidth: Int,
+                                                     targetHeight: Int) -> UVRect {
+        let targetW = Float(max(targetWidth, 1))
+        let targetH = Float(max(targetHeight, 1))
+        let srcW = Float(max(srcWidth, 1))
+        let srcH = Float(max(srcHeight, 1))
+
+        let scale = min(targetW / srcW, targetH / srcH)
+        let fitW = srcW * scale
+        let fitH = srcH * scale
+
+        let xMin = (targetW - fitW) / 2 / targetW
+        let yMin = (targetH - fitH) / 2 / targetH
+        let xMax = (targetW - fitW) / 2 / targetW + fitW / targetW
+        let yMax = (targetH - fitH) / 2 / targetH + fitH / targetH
+        return UVRect(xMin: xMin, xMax: xMax, yMin: yMin, yMax: yMax)
+    }
+
+    fileprivate struct UVRect {
+        var xMin: Float
+        var xMax: Float
+        var yMin: Float
+        var yMax: Float
     }
 
     private static func loadFunction(library: MTLLibrary, name: String) throws -> MTLFunction {
