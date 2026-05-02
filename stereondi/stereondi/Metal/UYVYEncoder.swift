@@ -29,7 +29,6 @@ final class UYVYEncoder {
         case defaultLibraryUnavailable
         case kernelFunctionMissing(String)
         case pipelineCreationFailed(Swift.Error)
-        case oddSourceWidth(Int)
     }
 
     private let device: MTLDevice
@@ -53,14 +52,15 @@ final class UYVYEncoder {
     /// Encode `source` into the provided UYVY-formatted MTLBuffer. The
     /// buffer must be at least `bytesPerRow * source.height` bytes.
     /// `bytesPerRow` is typically `source.width * 2`.
-    /// Source width must be even (UYVY pairs).
+    /// Source width must be even (UYVY pairs); this is a programmer
+    /// invariant (precondition) — every caller in the project always
+    /// supplies a 1920-wide source.
     func encode(source: MTLTexture,
                 into uyvyBuffer: MTLBuffer,
                 bytesPerRow: Int,
-                commandBuffer: MTLCommandBuffer) throws {
-        guard source.width % 2 == 0 else {
-            throw Error.oddSourceWidth(source.width)
-        }
+                commandBuffer: MTLCommandBuffer) {
+        precondition(source.width % 2 == 0,
+                     "UYVYEncoder requires even source width, got \(source.width)")
 
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             return

@@ -22,6 +22,20 @@ struct MetalPreviewView: UIViewRepresentable {
     let pairer: FramePairer
     let compositor: StereoCompositor
     let device: MTLDevice
+    /// Optional NDI sender pipeline; when present, the pairer's tick
+    /// triggers a UYVY encode + send in addition to the on-screen
+    /// redraw. Slice #5's wiring; nil in test/preview contexts.
+    let senderPipeline: SenderPipeline?
+
+    init(pairer: FramePairer,
+         compositor: StereoCompositor,
+         device: MTLDevice,
+         senderPipeline: SenderPipeline? = nil) {
+        self.pairer = pairer
+        self.compositor = compositor
+        self.device = device
+        self.senderPipeline = senderPipeline
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(compositor: compositor, device: device)
@@ -41,12 +55,12 @@ struct MetalPreviewView: UIViewRepresentable {
         view.clearColor = MTLClearColorMake(0, 0, 0, 1)
         view.delegate = context.coordinator
 
-        context.coordinator.attach(to: view, pairer: pairer)
+        context.coordinator.attach(to: view, pairer: pairer, senderPipeline: senderPipeline)
         return view
     }
 
     func updateUIView(_ uiView: MTKView, context: Context) {
-        context.coordinator.attach(to: uiView, pairer: pairer)
+        context.coordinator.attach(to: uiView, pairer: pairer, senderPipeline: senderPipeline)
     }
 
     @MainActor
@@ -67,17 +81,26 @@ struct MetalPreviewView: UIViewRepresentable {
             super.init()
         }
 
-        func attach(to view: MTKView, pairer: FramePairer) {
+        func attach(to view: MTKView,
+                    pairer: FramePairer,
+                    senderPipeline: SenderPipeline?) {
             self.view = view
             // Replace the pairer's tick handler with one bound to this
-            // Coordinator so the latest pair is always cached here and
-            // the MTKView is asked to redraw exactly when the pairer
-            // ticks. updateUIView re-runs this on every SwiftUI update,
-            // which is safe — the assignment is just a closure swap.
-            pairer.onTick = { [weak self] pair in
+            // Coordinator. The closure (a) caches the latest pair and
+            // marks the MTKView as needing display, and (b) — if a
+            // sender pipeline is wired up — kicks the UYVY encode +
+            // NDI send on a separate command buffer so screen presents
+            // and network sends never block each other.
+            //
+            // updateUIView re-runs this on every SwiftUI update, which
+            // is safe: the assignment is just a closure swap.
+            pairer.onTick = { [weak self, weak senderPipeline] pair in
                 guard let self else { return }
                 self.latestPair = pair
                 self.view?.setNeedsDisplay()
+                if let senderPipeline {
+                    senderPipeline.send(pair: pair, compositor: self.compositor)
+                }
             }
         }
 
