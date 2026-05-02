@@ -30,20 +30,25 @@ then exits the test as a pass without comparing.
 ## First-run on a fresh checkout
 
 Slice #4 shipped the test scaffolding without the reference PNGs
-because the agents writing slices #4 and #6 ran on Linux where Metal
-isn't available. The first developer who runs the tests on a Mac will
-see `GoldenImageError.missingReference(...)` for any unseeded golden.
-The fix is to run the tests once with `STEREONDI_UPDATE_GOLDENS=1` to
-seed the reference PNGs, then re-run normally to confirm the
-comparisons pass.
+because the agents writing slices #4, #6, and #7 ran on Linux where
+Metal isn't available. The first developer who runs the tests on a
+Mac will see `GoldenImageError.missingReference(...)` for any unseeded
+golden. The fix is to run the tests once with
+`STEREONDI_UPDATE_GOLDENS=1` to seed the reference PNGs, then re-run
+normally to confirm the comparisons pass.
 
-Goldens currently expected (slice #4 + slice #6):
+Goldens currently expected (slices #4, #6, #7):
 
 - `sbs_zero_hit_gradient.png` — convergence 0 (slice #4 baseline)
-- `sbs_hit_p50.png`  — convergence +50
-- `sbs_hit_n50.png`  — convergence −50
-- `sbs_hit_p200.png` — convergence +200
-- `sbs_hit_p0_3.png` — convergence +0.3 (sub-pixel)
+- `sbs_hit_p50_crop_auto.png` — convergence +50, AUTO crop (renamed from `sbs_hit_p50.png` in slice #7 — same render, AUTO was implicit before)
+- `sbs_hit_p50_crop_off.png`  — convergence +50, OFF crop (slice #7; should show a thin black bar on the inside edge of one half)
+- `sbs_hit_n50.png`  — convergence −50 (auto)
+- `sbs_hit_p200.png` — convergence +200 (auto)
+- `sbs_hit_p0_3.png` — convergence +0.3 (sub-pixel, auto)
+
+Slice #7 note: if `sbs_hit_p50.png` is left over from a slice-#6 seed,
+delete it after re-running the seeding pass — the test now looks for
+the suffixed name.
 
 ## File-system-synchronized test target
 
