@@ -7,7 +7,7 @@
 #ifndef stereondi_Bridging_Header_h
 #define stereondi_Bridging_Header_h
 
-#import "NDI/NDIDiscoveryFirstSource.h"
+#import "NDI/NDIDiscovery.h"
 #import "NDI/NDIReceiver.h"
 #import "NDI/NDIRuntime.h"
 
