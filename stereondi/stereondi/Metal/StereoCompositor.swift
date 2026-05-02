@@ -18,13 +18,21 @@
 //   - The CPU computes (u_min, u_max) per eye by combining the eye's
 //     own HIT offset (in source pixels → normalized U) with the
 //     "common region" crop amount, which is `max(|leftHIT|, |rightHIT|)`
-//     normalized by source width. With auto-crop ON (the only mode in
-//     this slice), the resulting source UV stays in [0,1] for all
-//     dst_uv.x in [0,1] — no black bars.
+//     normalized by source width.
 //
-//  Slice #7 will add a crop-OFF mode by zeroing out the per-side
-//  cropping term and letting the shader's u_outside_source check
-//  produce black bars where the offset overshoots.
+//  Slice #7 additions:
+//   - `AlignmentState.cropMode` (.auto / .off) is threaded through
+//     `alignmentUniforms(...)` into the per-side `(uMin, uMax)`. With
+//     `.auto` the slice-#6 common-region math runs; with `.off` the
+//     window is exactly `[hitUV, hitUV + 1]` and the shader's
+//     `uv_outside_source` check produces visible black bars on the
+//     missing-edge of one half.
+//   - The trailing-padding slot in `AlignmentUniforms` is renamed
+//     `cropModeFlag` (0 = auto, 1 = off). The shader does not
+//     currently branch on it — the CPU has already done the right
+//     `(uMin, uMax)` math — but it's wired through so future shader
+//     work (anaglyph mode-specific behavior, telemetry overlays) can
+//     read the active mode without an extra binding.
 //
 //  The MTLTexture handed to render() is owned by the caller (typically
 //  an MTKView's currentDrawable). We do not present or commit; the
@@ -54,14 +62,13 @@ final class StereoCompositor {
 
     /// Per-side fragment-shader buffer-0 contents. Layout MUST stay in
     /// sync with the `AlignmentUniforms` struct in `Compositor.metal`.
-    /// `reservedCrop` is unused this slice; slice #7 repurposes it as
-    /// a mode flag — the Swift struct already reserves a trailing
-    /// padding float so the SIMD-aligned 16-byte layout doesn't shift
-    /// when `reservedCrop`'s meaning changes.
+    /// `cropModeFlag` is informational (0 = auto, 1 = off); the
+    /// chosen mode is already baked into `(uMin, uMax)`. The trailing
+    /// padding keeps the struct at a 16-byte SIMD-aligned size.
     struct AlignmentUniforms: Sendable {
         var uMin: Float
         var uMax: Float
-        var reservedCrop: Float = 0
+        var cropModeFlag: Float = 0
         var padding: Float = 0
     }
 
@@ -128,10 +135,12 @@ final class StereoCompositor {
 
         // Snapshot the values once per frame. The reads still happen on
         // MainActor (this method is @MainActor) but capturing into
-        // locals avoids two property accesses per side and makes the
-        // common-region math obviously consistent across eyes.
+        // locals avoids repeated property accesses per side and makes
+        // the common-region + crop-mode math obviously consistent
+        // across eyes.
         let leftHIT = alignment.leftHIT
         let rightHIT = alignment.rightHIT
+        let cropMode = alignment.cropMode
 
         // Hold CVMetalTextures alive until GPU completion. The MTLTexture
         // returned via CVMetalTextureGetTexture aliases the IOSurface
@@ -146,6 +155,7 @@ final class StereoCompositor {
                                 hitPixels: leftHIT,
                                 otherHitPixels: rightHIT,
                                 otherFrameWidth: pair.right?.width,
+                                cropMode: cropMode,
                                 targetWidth: target.width,
                                 targetHeight: target.height,
                                 targetPixelFormat: target.pixelFormat) {
@@ -159,6 +169,7 @@ final class StereoCompositor {
                                 hitPixels: rightHIT,
                                 otherHitPixels: leftHIT,
                                 otherFrameWidth: pair.left?.width,
+                                cropMode: cropMode,
                                 targetWidth: target.width,
                                 targetHeight: target.height,
                                 targetPixelFormat: target.pixelFormat) {
@@ -215,38 +226,42 @@ final class StereoCompositor {
         case right
     }
 
-    /// Compute per-eye `(u_min, u_max)` in source-UV space for the
-    /// auto-crop common-region mode.
+    /// Compute per-eye `(u_min, u_max, cropModeFlag)` in source-UV
+    /// space. Delegates the math to the pure
+    /// `AlignmentMath.uvWindow(...)` helper (so unit tests can exercise
+    /// it without touching Metal) and packs the result into the GPU
+    /// uniform layout.
     ///
-    /// The window samples a slice of the source equal in width to
-    /// `1 - 2 * commonAbsUV`, where `commonAbsUV` is `max(|leftHIT|,
-    /// |rightHIT|)` normalized by source width. The slice is centered
-    /// around `0.5 + hitUV` so HIT translates the visible source
-    /// region by the correct amount, and the slice's edges are
-    /// guaranteed to stay inside [0,1] because the eye with the larger
-    /// |HIT| still has `commonAbsUV` of headroom on its outside edge.
+    /// `.auto` mode samples a slice of width `1 − 2 × commonAbsUV`
+    /// where `commonAbsUV = max(|leftHitUV|, |rightHitUV|)`, so the
+    /// window stays inside `[0, 1]` and the operator sees no black
+    /// bars regardless of HIT. `.off` mode samples exactly
+    /// `[hitUV, hitUV + 1]`, letting the shader's out-of-source
+    /// black-bar branch reveal what HIT is shifting.
     ///
-    /// When both HITs are zero, this collapses to (u_min=0, u_max=1) —
-    /// the existing zero-HIT golden test continues to pass unchanged.
+    /// When both HITs are zero (either mode), the window collapses to
+    /// `(0, 1)` — the slice-#4 zero-HIT golden continues to render
+    /// byte-identical.
+    ///
+    /// `otherSourceWidthPixels: nil` (lone-eye case) falls back to
+    /// this eye's width so the auto-crop math still produces a
+    /// sensible window.
     nonisolated static func alignmentUniforms(forSideHITPixels hit: Double,
                                               otherSideHITPixels otherHit: Double,
                                               sourceWidthPixels: Int,
-                                              otherSourceWidthPixels: Int?) -> AlignmentUniforms {
+                                              otherSourceWidthPixels: Int?,
+                                              cropMode: CropMode) -> AlignmentUniforms {
         let srcW = Double(max(sourceWidthPixels, 1))
-        let hitUV = AlignmentMath.hitToUVOffset(hitPixels: hit, sourceWidthPixels: srcW)
-
-        // Compute the cross-eye max in normalized UV, using each eye's
-        // own source width. When the other eye's frame is missing or
-        // its width is unknown, fall back to this eye's width so the
-        // lone-eye case still gets sensible cropping.
-        let otherWidth = Double(max(otherSourceWidthPixels ?? sourceWidthPixels, 1))
-        let otherHitUV = AlignmentMath.hitToUVOffset(hitPixels: otherHit,
-                                                     sourceWidthPixels: otherWidth)
-        let commonAbsUV = max(abs(hitUV), abs(otherHitUV))
-
-        let uMin = commonAbsUV + hitUV
-        let uMax = (1.0 - commonAbsUV) + hitUV
-        return AlignmentUniforms(uMin: Float(uMin), uMax: Float(uMax))
+        let otherW = Double(max(otherSourceWidthPixels ?? sourceWidthPixels, 1))
+        let window = AlignmentMath.uvWindow(hitPixels: hit,
+                                            otherHitPixels: otherHit,
+                                            sourceWidthPixels: srcW,
+                                            otherSourceWidthPixels: otherW,
+                                            cropMode: cropMode)
+        let flag: Float = (cropMode == .off) ? 1.0 : 0.0
+        return AlignmentUniforms(uMin: Float(window.uMin),
+                                 uMax: Float(window.uMax),
+                                 cropModeFlag: flag)
     }
 
     @discardableResult
@@ -256,6 +271,7 @@ final class StereoCompositor {
                           hitPixels: Double,
                           otherHitPixels: Double,
                           otherFrameWidth: Int?,
+                          cropMode: CropMode,
                           targetWidth: Int,
                           targetHeight: Int,
                           targetPixelFormat: MTLPixelFormat) -> CVMetalTexture? {
@@ -303,7 +319,8 @@ final class StereoCompositor {
         var uniforms = Self.alignmentUniforms(forSideHITPixels: hitPixels,
                                               otherSideHITPixels: otherHitPixels,
                                               sourceWidthPixels: frame.width,
-                                              otherSourceWidthPixels: otherFrameWidth)
+                                              otherSourceWidthPixels: otherFrameWidth,
+                                              cropMode: cropMode)
 
         encoder.setRenderPipelineState(pipelineState)
         encoder.setVertexBytes(&verts,

@@ -1,20 +1,21 @@
 //  Compositor.metal
 //
 //  Slice #4 stereo compositor — one mode (SbS, no anaglyph). Slice #6
-//  adds per-eye HIT (sub-pixel via texture-coord offset + hardware
+//  added per-eye HIT (sub-pixel via texture-coord offset + hardware
 //  bilinear filtering) plus an auto-crop "common region" implemented
-//  as a per-side source-UV remap. Slice #7 will add anaglyph and the
-//  channel-test mode and toggle the auto-crop OFF.
+//  as a per-side source-UV remap. Slice #7 adds the crop-mode toggle.
 //
 //  Per-side fragment buffer 0 carries an `AlignmentUniforms` value
 //  computed CPU-side from AlignmentState + the source's own width. The
 //  shader maps destination UV in [0,1] to source UV in [uMin, uMax],
-//  which is the auto-cropped + HIT-translated visible region of the
-//  source. With auto-crop the mapped UV is always in [0,1] so the
-//  out-of-range black check below is dead-code in this slice — it
-//  exists ahead of the slice #7 OFF mode where uMin can go negative
-//  and uMax can exceed 1, and we want black bars on the missing edge
-//  rather than clamp-to-edge smearing.
+//  which is the cropped (or full, depending on mode) HIT-translated
+//  visible region of the source. The shader itself does NOT branch on
+//  the crop mode — the CPU sets `(u_min, u_max)` to the correct
+//  window for the mode and the shader's `uv_outside_source` check
+//  produces black bars wherever the window pokes outside [0, 1] (the
+//  OFF-mode case). The `crop_mode_flag` field is purely informational
+//  in the shader for now (0 = auto, 1 = off); future per-mode shader
+//  branches (e.g. anaglyph specialization) can read it.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -31,12 +32,14 @@ struct SbSVaryings {
 
 // Per-side alignment uniforms. Layout matches the Swift
 // `StereoCompositor.AlignmentUniforms` struct exactly. The
-// `reservedCrop` field is unused this slice (slice #7 will repurpose
-// it as a crop-mode flag); kept here so the layout stays stable.
+// `crop_mode_flag` field is informational only in this slice (0 =
+// auto, 1 = off); the (u_min, u_max) the CPU writes already encodes
+// the chosen mode's sampling window, and the shader's
+// `uv_outside_source` branch handles the OFF-mode black bars.
 struct AlignmentUniforms {
     float u_min;
     float u_max;
-    float reserved_crop;
+    float crop_mode_flag;
     float _padding;
 };
 
