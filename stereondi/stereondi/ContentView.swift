@@ -8,6 +8,23 @@
 //  on the same tick the SenderPipeline pushes a 1920×1080 UYVY copy
 //  out via NDISender.
 //
+//  Slice #12 additions:
+//   - `NetworkResilience` watches NWPathMonitor; on interface change
+//     the `ReceiverWatchdog` calls `kickReconnect` on both receivers.
+//   - `ReceiverWatchdog` ticks at 1 Hz, promotes `.live` → `.stalled`
+//     at the 2 s mark, kicks reconnects every 2 s on `.stalled` and
+//     `.disconnected`, and surfaces a per-side `SideStatus` for the
+//     overlays.
+//   - `SessionStatus` collects mismatch / interlace / alpha warnings
+//     from FramePairer ticks; the WarningBanner overlays them.
+//   - The pairer now hands the watchdog's per-side status into each
+//     `StereoFramePair`, and freezes the last good frame per side
+//     when the live capture goes nil but the receiver has been live
+//     within the stall window.
+//   - Per-eye `ReceiverStatusOverlay` views sit atop each preview
+//     half so the operator sees "Reconnecting…" / "Stalled" /
+//     "No source" without the Metal compositor having to draw text.
+//
 //  Slice #6 added the bottom alignment bar, the on-preview gesture
 //  overlay (two-finger pan / pinch / double-tap), and threads a
 //  shared AlignmentState through both render paths so HIT changes
@@ -52,6 +69,9 @@ struct ContentView: View {
     @State private var alignment = AlignmentState()
     @State private var output = OutputStreamConfig()
     @State private var favorites = FavoritesViewModel()
+    @State private var status = SessionStatus()
+    @State private var network = NetworkResilience()
+    @State private var watchdog: ReceiverWatchdog?
     @State private var zoom: CGFloat = 1.0
 
     @State private var compositor: StereoCompositor?
@@ -87,6 +107,21 @@ struct ContentView: View {
                 }
             }
 
+            // Per-eye status overlays sit between the Metal preview
+            // and the gesture overlay so the "Reconnecting…" /
+            // "Stalled" / "No source" text is legible without
+            // dimming the gesture surface. Hidden when both sides
+            // are .live (the EmptyView in ReceiverStatusOverlay).
+            if let watchdog {
+                HStack(spacing: 0) {
+                    ReceiverStatusOverlay(side: .left,
+                                          status: watchdog.leftStatus)
+                    ReceiverStatusOverlay(side: .right,
+                                          status: watchdog.rightStatus)
+                }
+                .allowsHitTesting(false)
+            }
+
             // Gesture overlay sits between the preview and the
             // chrome bars; two-finger pans and pinches are captured
             // here, single-finger touches fall through to the chrome.
@@ -99,6 +134,7 @@ struct ContentView: View {
                        output: output,
                        discovered: discovered,
                        pickerSide: $pickerSide)
+                WarningBanner(status: status)
                 Spacer()
                 BottomBar(alignment: alignment)
             }
@@ -125,6 +161,8 @@ struct ContentView: View {
         .onDisappear {
             pairer?.stop()
             senderPipeline?.stop()
+            watchdog?.stop()
+            network.stop()
         }
         .onChange(of: selection.leftSource) { _, newLeft in
             apply(source: newLeft, to: receiverLeft)
@@ -188,16 +226,49 @@ struct ContentView: View {
             // transitions go through — one canonical entry point.
             senderPipeline.reconfigure(streamName: output.effectiveStreamName,
                                        groups: output.effectiveGroups)
+
+            // Slice #12: stand the watchdog up alongside the network
+            // monitor. The watchdog ticks at 1 Hz, kicks reconnects on
+            // .stalled / .disconnected, and surfaces SideStatus to
+            // both the FramePairer (for freeze-frame fallback) and
+            // the ReceiverStatusOverlay (for the per-eye text).
+            let watchdog = ReceiverWatchdog(left: receiverLeft,
+                                            right: receiverRight,
+                                            network: network)
+            watchdog.start()
+            network.start()
+
             // The MetalPreviewView's Coordinator owns the per-tick
             // onTick closure and chains the SenderPipeline into it,
-            // so we don't pre-set onTick here.
-            let pairer = FramePairer(left: receiverLeft, right: receiverRight)
+            // so we don't pre-set onTick here. The pairer's status
+            // wiring is set unconditionally because it doesn't
+            // depend on the MTKView lifecycle.
+            let pairer = FramePairer(
+                left: receiverLeft,
+                right: receiverRight,
+                statusProvider: { [weak watchdog] in
+                    guard let watchdog else {
+                        return (left: .empty, right: .empty)
+                    }
+                    return (left: watchdog.leftStatus,
+                            right: watchdog.rightStatus)
+                },
+                statusObserver: { [status] leftSize, rightSize, leftIL, rightIL, leftA, rightA in
+                    status.update(leftSize: leftSize,
+                                  rightSize: rightSize,
+                                  leftInterlaced: leftIL,
+                                  rightInterlaced: rightIL,
+                                  leftHasAlpha: leftA,
+                                  rightHasAlpha: rightA)
+                }
+            )
             pairer.start()
             self.device = device
             self.commandQueue = queue
             self.compositor = compositor
             self.pairer = pairer
             self.senderPipeline = senderPipeline
+            self.watchdog = watchdog
         } catch {
             initError = "Failed to initialize render pipeline: \(error)"
         }
