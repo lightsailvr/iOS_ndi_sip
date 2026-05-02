@@ -18,10 +18,26 @@
 //  `OutputStreamConfig` model owns the raw + effective values; this
 //  view's `.onChange` handlers feed each effective-value change into
 //  `senderPipeline.reconfigure(...)`, which restarts the underlying
-//  NDISender in place. Scene-foreground transitions also re-call
-//  `reconfigure(...)` so the operator's last-applied identity survives
-//  background→foreground (in-memory only this slice; persistence
-//  across app launches is slice #11).
+//  NDISender in place.
+//
+//  Slice #11 adds persistence + silent auto-reconnect:
+//   - All four state owners (`selection`, `alignment`, `output`,
+//     `favorites`) hydrate from `SessionStore.shared` at construction
+//     time. Selection's restored value is the operator's last-picked
+//     L/R pair from the previous session.
+//   - SwiftUI's `.onChange` does NOT fire for the initial value, so
+//     the restored selection wouldn't drive the receivers without an
+//     explicit `apply(...)` at appear time. The `.task` block does
+//     that apply, then waits 5 s and presents the source picker if
+//     neither receiver has reached `.live`. (Per issue: "succeeds
+//     silently if sources are present, falls back to picker after 5 s
+//     timeout".)
+//   - The picker presentation state is owned here (rather than inside
+//     TopBar) so both the user-driven flow (TopBar source-button
+//     taps) and the auto-present-on-reconnect-timeout flow drive the
+//     same single sheet — iOS only allows one sheet per ancestor.
+//   - Settings sheet now also gets `alignment` and `store` so the
+//     "Reset session" action and "Default mode on launch" picker work.
 
 import Metal
 import SwiftUI
@@ -35,6 +51,7 @@ struct ContentView: View {
     @State private var discovered = DiscoveredSources()
     @State private var alignment = AlignmentState()
     @State private var output = OutputStreamConfig()
+    @State private var favorites = FavoritesViewModel()
     @State private var zoom: CGFloat = 1.0
 
     @State private var compositor: StereoCompositor?
@@ -43,6 +60,11 @@ struct ContentView: View {
     @State private var commandQueue: MTLCommandQueue?
     @State private var senderPipeline: SenderPipeline?
     @State private var initError: String?
+
+    /// Source-picker presentation. Lifted from TopBar so the auto-
+    /// reconnect timeout can also present the picker without fighting
+    /// TopBar over which sheet is on top.
+    @State private var pickerSide: SourcePickerSheet.Side?
 
     var body: some View {
         ZStack {
@@ -75,7 +97,8 @@ struct ContentView: View {
                 TopBar(selection: selection,
                        alignment: alignment,
                        output: output,
-                       discovered: discovered)
+                       discovered: discovered,
+                       pickerSide: $pickerSide)
                 Spacer()
                 BottomBar(alignment: alignment)
             }
@@ -84,8 +107,20 @@ struct ContentView: View {
                 searchOverlay
             }
         }
+        .sheet(item: $pickerSide) { side in
+            SourcePickerSheet(
+                side: side,
+                selection: selection,
+                discovered: discovered,
+                favorites: favorites,
+                alignment: alignment
+            )
+        }
         .onAppear {
             initializeRenderer()
+        }
+        .task {
+            await silentAutoReconnect()
         }
         .onDisappear {
             pairer?.stop()
@@ -165,6 +200,32 @@ struct ContentView: View {
             self.senderPipeline = senderPipeline
         } catch {
             initError = "Failed to initialize render pipeline: \(error)"
+        }
+    }
+
+    /// Silent auto-reconnect (slice #11). Apply the persisted L/R
+    /// selection to the receivers immediately, then wait 5 s and
+    /// present the picker if neither side has reached `.live`. With
+    /// no persisted selection (cold first launch) there's nothing to
+    /// reconnect to — present the picker immediately rather than
+    /// waste 5 s of staring at the search overlay.
+    private func silentAutoReconnect() async {
+        // SwiftUI .onChange doesn't fire on the initial value, so
+        // explicitly drive the receivers from the restored selection.
+        // For the cold-launch case both sides are nil; apply(...) is
+        // a no-op and the receivers stay idle.
+        apply(source: selection.leftSource, to: receiverLeft)
+        apply(source: selection.rightSource, to: receiverRight)
+
+        guard selection.leftSource != nil || selection.rightSource != nil else {
+            pickerSide = .left
+            return
+        }
+
+        try? await Task.sleep(for: .seconds(5))
+
+        if receiverLeft.state != .live && receiverRight.state != .live {
+            pickerSide = .left
         }
     }
 
