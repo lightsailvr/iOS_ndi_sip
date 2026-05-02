@@ -1,14 +1,19 @@
 //  ContentView.swift
 //
 //  Wires the two NDI receivers, the FramePairer, the StereoCompositor,
-//  the MetalPreviewView, and the SenderPipeline together. Each side of
-//  `selection` drives its own receiver via .onChange; the pairer pulls
-//  both at vsync, the compositor draws their SbS into the MTKView, and
-//  on the same tick the SenderPipeline pushes a 1920×1080 UYVY copy
-//  out via NDISender.
+//  the MetalPreviewView, the SenderPipeline, and the AlignmentState
+//  together. Each side of `selection` drives its own receiver via
+//  .onChange; the pairer pulls both at vsync, the compositor draws
+//  their HIT-corrected SbS into the MTKView, and on the same tick the
+//  SenderPipeline pushes a 1920×1080 UYVY copy out via NDISender.
 //
 //  Slice #5 hardcodes the output stream name ("Stereo Preview") and
 //  groups ("Public"); slice #10 makes both editable from Settings.
+//
+//  Slice #6 adds the bottom alignment bar, the on-preview gesture
+//  overlay (two-finger pan / pinch / double-tap), and threads a
+//  shared AlignmentState through both render paths so HIT changes
+//  reflect on the iPad screen and in the NDI output within one frame.
 
 import Metal
 import SwiftUI
@@ -20,6 +25,8 @@ struct ContentView: View {
     @State private var receiverRight = NDIReceiver.receiver()
     @State private var selection = SourceSelection()
     @State private var discovered = DiscoveredSources()
+    @State private var alignment = AlignmentState()
+    @State private var zoom: CGFloat = 1.0
 
     @State private var compositor: StereoCompositor?
     @State private var pairer: FramePairer?
@@ -39,7 +46,9 @@ struct ContentView: View {
                 MetalPreviewView(pairer: pairer,
                                  compositor: compositor,
                                  device: device,
+                                 alignment: alignment,
                                  senderPipeline: senderPipeline)
+                    .scaleEffect(zoom)
                     .ignoresSafeArea()
             } else if let initError {
                 VStack(spacing: 8) {
@@ -50,9 +59,16 @@ struct ContentView: View {
                 }
             }
 
+            // Gesture overlay sits between the preview and the
+            // chrome bars; two-finger pans and pinches are captured
+            // here, single-finger touches fall through to the chrome.
+            PreviewGestureOverlay(alignment: alignment, zoom: $zoom)
+                .ignoresSafeArea()
+
             VStack {
                 TopBar(selection: selection, discovered: discovered)
                 Spacer()
+                BottomBar(alignment: alignment)
             }
 
             if selection.leftSource == nil && selection.rightSource == nil {

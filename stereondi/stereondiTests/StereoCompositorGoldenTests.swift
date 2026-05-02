@@ -1,15 +1,21 @@
 //  StereoCompositorGoldenTests.swift
 //
-//  One reference golden: zero-HIT SbS of two synthetic gradient pixel
-//  buffers (red on the left, blue on the right). Renders into a
-//  1920×1080 BGRA Metal texture, reads it back, then either
+//  Five reference goldens for the SbS compositor:
 //
-//    - compares against the bundled reference PNG (default), or
-//    - rewrites the reference PNG (when STEREONDI_UPDATE_GOLDENS=1).
+//   1. zero-HIT SbS gradient (slice #4 baseline) — `sbs_zero_hit_gradient.png`
+//   2. +50 px convergence  — `sbs_hit_p50.png`
+//   3. −50 px convergence  — `sbs_hit_n50.png`
+//   4. +200 px convergence — `sbs_hit_p200.png`
+//   5. +0.3 px sub-pixel convergence — `sbs_hit_p0_3.png`
+//
+//  Each renders the same red-left / blue-right gradient pair but with
+//  the AlignmentState's convergence dialed to the listed value, then
+//  either compares against the bundled reference PNG (default) or
+//  rewrites it (when STEREONDI_UPDATE_GOLDENS=1).
 //
 //  The first test run on a developer Mac will fail with
-//  GoldenImageError.missingReference; that's the cue to set
-//  STEREONDI_UPDATE_GOLDENS=1 once and re-run to seed the reference.
+//  GoldenImageError.missingReference for the four new HIT goldens —
+//  set STEREONDI_UPDATE_GOLDENS=1 once and re-run to seed them.
 //
 //  See stereondiTests/Goldens/README.md for the workflow.
 
@@ -24,6 +30,33 @@ struct StereoCompositorGoldenTests {
 
     @Test
     func zeroHitSbSGradientPair() throws {
+        try renderAndCompare(named: "sbs_zero_hit_gradient", convergence: 0)
+    }
+
+    @Test
+    func hitPositive50() throws {
+        try renderAndCompare(named: "sbs_hit_p50", convergence: 50)
+    }
+
+    @Test
+    func hitNegative50() throws {
+        try renderAndCompare(named: "sbs_hit_n50", convergence: -50)
+    }
+
+    @Test
+    func hitPositive200() throws {
+        try renderAndCompare(named: "sbs_hit_p200", convergence: 200)
+    }
+
+    @Test
+    func hitSubPixel0_3() throws {
+        try renderAndCompare(named: "sbs_hit_p0_3", convergence: 0.3)
+    }
+
+    // MARK: - Test harness
+
+    private func renderAndCompare(named referenceName: String,
+                                  convergence: Double) throws {
         let device = try MetalRenderUtilities.makeDevice()
         let queue = try MetalRenderUtilities.makeCommandQueue(device: device)
         let target = try MetalRenderUtilities.makeRenderTarget(device: device)
@@ -34,11 +67,17 @@ struct StereoCompositorGoldenTests {
         let leftFrame = StubVideoFrame(pixelBuffer: leftPB)
         let rightFrame = StubVideoFrame(pixelBuffer: rightPB)
 
+        let alignment = AlignmentState()
+        alignment.convergence = convergence
+
         let compositor = try StereoCompositor(device: device)
         let pair = StereoFramePair(left: leftFrame, right: rightFrame, hostTime: 0)
 
         let commandBuffer = try #require(queue.makeCommandBuffer())
-        compositor.render(pair: pair, into: target, commandBuffer: commandBuffer)
+        compositor.render(pair: pair,
+                          alignment: alignment,
+                          into: target,
+                          commandBuffer: commandBuffer)
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
@@ -47,18 +86,18 @@ struct StereoCompositorGoldenTests {
         if ProcessInfo.processInfo.environment["STEREONDI_UPDATE_GOLDENS"] == "1" {
             let dir = goldensDirectory()
             try GoldenImage.write(candidate,
-                                  named: "sbs_zero_hit_gradient",
+                                  named: referenceName,
                                   toDirectory: dir)
-            print("STEREONDI_UPDATE_GOLDENS=1 → wrote sbs_zero_hit_gradient.png to \(dir.path)")
+            print("STEREONDI_UPDATE_GOLDENS=1 → wrote \(referenceName).png to \(dir.path)")
             return
         }
 
-        let reference = try GoldenImage.loadReference(named: "sbs_zero_hit_gradient")
+        let reference = try GoldenImage.loadReference(named: referenceName)
         let result = GoldenImage.compare(candidate,
                                          against: reference,
                                          tolerance: 0.02)
         #expect(result.passed,
-                "Golden mismatch: worstΔ=\(result.worstChannelDiff), failingPixels=\(result.failingPixelCount)/\(result.totalPixelCount)")
+                "Golden mismatch for \(referenceName): worstΔ=\(result.worstChannelDiff), failingPixels=\(result.failingPixelCount)/\(result.totalPixelCount)")
     }
 
     /// Resolve the Goldens directory from `#filePath` so an

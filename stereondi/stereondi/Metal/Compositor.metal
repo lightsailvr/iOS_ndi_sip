@@ -1,15 +1,20 @@
 //  Compositor.metal
 //
-//  Slice #4 stereo compositor — one mode (SbS, no HIT, no anaglyph).
-//  Each per-eye draw call submits a single triangle list (4 verts /
-//  2 triangles via .triangleStrip) covering the aspect-fit region of
-//  one half of the target. Two fragment paths share one vertex shader:
-//   - sbs_fragment_bgra : straight BGRA8 sample
-//   - sbs_fragment_uyvy : sampled .bgrg422 → BT.709-limited YCbCr → RGB
+//  Slice #4 stereo compositor — one mode (SbS, no anaglyph). Slice #6
+//  adds per-eye HIT (sub-pixel via texture-coord offset + hardware
+//  bilinear filtering) plus an auto-crop "common region" implemented
+//  as a per-side source-UV remap. Slice #7 will add anaglyph and the
+//  channel-test mode and toggle the auto-crop OFF.
 //
-//  Slice #6 will add HIT + crop math; slice #7 adds anaglyph and the
-//  channel-test mode. The vertex format and per-side draw structure
-//  are the seam those slices extend.
+//  Per-side fragment buffer 0 carries an `AlignmentUniforms` value
+//  computed CPU-side from AlignmentState + the source's own width. The
+//  shader maps destination UV in [0,1] to source UV in [uMin, uMax],
+//  which is the auto-cropped + HIT-translated visible region of the
+//  source. With auto-crop the mapped UV is always in [0,1] so the
+//  out-of-range black check below is dead-code in this slice — it
+//  exists ahead of the slice #7 OFF mode where uMin can go negative
+//  and uMax can exceed 1, and we want black bars on the missing edge
+//  rather than clamp-to-edge smearing.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -24,6 +29,17 @@ struct SbSVaryings {
     float2 uv;
 };
 
+// Per-side alignment uniforms. Layout matches the Swift
+// `StereoCompositor.AlignmentUniforms` struct exactly. The
+// `reservedCrop` field is unused this slice (slice #7 will repurpose
+// it as a crop-mode flag); kept here so the layout stays stable.
+struct AlignmentUniforms {
+    float u_min;
+    float u_max;
+    float reserved_crop;
+    float _padding;
+};
+
 vertex SbSVaryings sbs_vertex(SbSVertexIn in [[stage_in]]) {
     SbSVaryings out;
     out.position = float4(in.position, 0.0, 1.0);
@@ -31,10 +47,26 @@ vertex SbSVaryings sbs_vertex(SbSVertexIn in [[stage_in]]) {
     return out;
 }
 
+// Map destination UV ∈ [0,1] to source UV ∈ [u_min, u_max]. Y is
+// untouched — HIT is a horizontal (U) operation only.
+static inline float2 remapped_source_uv(float2 dst_uv, constant AlignmentUniforms& a) {
+    float src_u = a.u_min + dst_uv.x * (a.u_max - a.u_min);
+    return float2(src_u, dst_uv.y);
+}
+
+static inline bool uv_outside_source(float2 src_uv) {
+    return src_uv.x < 0.0f || src_uv.x > 1.0f;
+}
+
 fragment half4 sbs_fragment_bgra(SbSVaryings in [[stage_in]],
-                                 texture2d<half> source [[texture(0)]]) {
+                                 texture2d<half> source [[texture(0)]],
+                                 constant AlignmentUniforms& alignment [[buffer(0)]]) {
+    float2 src_uv = remapped_source_uv(in.uv, alignment);
+    if (uv_outside_source(src_uv)) {
+        return half4(0.0h, 0.0h, 0.0h, 1.0h);
+    }
     constexpr sampler s(filter::linear, address::clamp_to_edge);
-    half4 c = source.sample(s, in.uv);
+    half4 c = source.sample(s, src_uv);
     return half4(c.rgb, 1.0h);
 }
 
@@ -48,9 +80,14 @@ fragment half4 sbs_fragment_bgra(SbSVaryings in [[stage_in]],
 // .gbgr422; the math below stays the same, only the format binding
 // in StereoCompositor.swift changes.
 fragment half4 sbs_fragment_uyvy(SbSVaryings in [[stage_in]],
-                                 texture2d<half> source [[texture(0)]]) {
+                                 texture2d<half> source [[texture(0)]],
+                                 constant AlignmentUniforms& alignment [[buffer(0)]]) {
+    float2 src_uv = remapped_source_uv(in.uv, alignment);
+    if (uv_outside_source(src_uv)) {
+        return half4(0.0h, 0.0h, 0.0h, 1.0h);
+    }
     constexpr sampler s(filter::linear, address::clamp_to_edge);
-    half4 sample = source.sample(s, in.uv);
+    half4 sample = source.sample(s, src_uv);
 
     half y  = sample.r;
     half cb = sample.g - 0.5h;

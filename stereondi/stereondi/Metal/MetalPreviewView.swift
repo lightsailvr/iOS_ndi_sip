@@ -10,8 +10,10 @@
 //  command buffer's submission cadence and the pairer's pull cadence
 //  are always in lockstep.
 //
-//  Slice #2's CIContext-based rendering is gone — every pixel from
-//  here on is drawn by the StereoCompositor's shader pipelines.
+//  Slice #6: the AlignmentState is threaded through to both the
+//  on-screen draw and the optional SenderPipeline. The Coordinator
+//  holds a reference (not a copy) so a slider drag or a two-finger
+//  pan reflects in the very next rendered frame.
 
 import Metal
 import MetalKit
@@ -22,6 +24,7 @@ struct MetalPreviewView: UIViewRepresentable {
     let pairer: FramePairer
     let compositor: StereoCompositor
     let device: MTLDevice
+    let alignment: AlignmentState
     /// Optional NDI sender pipeline; when present, the pairer's tick
     /// triggers a UYVY encode + send in addition to the on-screen
     /// redraw. Slice #5's wiring; nil in test/preview contexts.
@@ -30,15 +33,17 @@ struct MetalPreviewView: UIViewRepresentable {
     init(pairer: FramePairer,
          compositor: StereoCompositor,
          device: MTLDevice,
+         alignment: AlignmentState,
          senderPipeline: SenderPipeline? = nil) {
         self.pairer = pairer
         self.compositor = compositor
         self.device = device
+        self.alignment = alignment
         self.senderPipeline = senderPipeline
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(compositor: compositor, device: device)
+        Coordinator(compositor: compositor, device: device, alignment: alignment)
     }
 
     func makeUIView(context: Context) -> MTKView {
@@ -60,6 +65,7 @@ struct MetalPreviewView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: MTKView, context: Context) {
+        context.coordinator.alignment = alignment
         context.coordinator.attach(to: uiView, pairer: pairer, senderPipeline: senderPipeline)
     }
 
@@ -67,13 +73,15 @@ struct MetalPreviewView: UIViewRepresentable {
     final class Coordinator: NSObject, MTKViewDelegate {
         let device: MTLDevice
         var compositor: StereoCompositor
+        var alignment: AlignmentState
         private let commandQueue: MTLCommandQueue
         private weak var view: MTKView?
         private var latestPair: StereoFramePair = StereoFramePair(left: nil, right: nil, hostTime: 0)
 
-        init(compositor: StereoCompositor, device: MTLDevice) {
+        init(compositor: StereoCompositor, device: MTLDevice, alignment: AlignmentState) {
             self.compositor = compositor
             self.device = device
+            self.alignment = alignment
             guard let queue = device.makeCommandQueue() else {
                 fatalError("Failed to create Metal command queue")
             }
@@ -99,7 +107,9 @@ struct MetalPreviewView: UIViewRepresentable {
                 self.latestPair = pair
                 self.view?.setNeedsDisplay()
                 if let senderPipeline {
-                    senderPipeline.send(pair: pair, compositor: self.compositor)
+                    senderPipeline.send(pair: pair,
+                                        alignment: self.alignment,
+                                        compositor: self.compositor)
                 }
             }
         }
@@ -113,6 +123,7 @@ struct MetalPreviewView: UIViewRepresentable {
             }
 
             compositor.render(pair: latestPair,
+                              alignment: alignment,
                               into: drawable.texture,
                               commandBuffer: commandBuffer)
 
