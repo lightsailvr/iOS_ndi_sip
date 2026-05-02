@@ -41,13 +41,23 @@ protocol VideoFrameReceiving: AnyObject {
 struct StereoFramePair: @unchecked Sendable {
     let left: (any VideoFrameSource)?
     let right: (any VideoFrameSource)?
+    /// Per-eye status as observed by the FramePairer at this tick.
+    /// Populated by the pairer in slice #12; older callers that
+    /// constructed `StereoFramePair` without status get `.empty`
+    /// defaults via the convenience initializer below.
+    let leftStatus: ReceiverWatchdog.SideStatus
+    let rightStatus: ReceiverWatchdog.SideStatus
     let hostTime: CFTimeInterval
 
     init(left: (any VideoFrameSource)?,
          right: (any VideoFrameSource)?,
+         leftStatus: ReceiverWatchdog.SideStatus = .empty,
+         rightStatus: ReceiverWatchdog.SideStatus = .empty,
          hostTime: CFTimeInterval) {
         self.left = left
         self.right = right
+        self.leftStatus = leftStatus
+        self.rightStatus = rightStatus
         self.hostTime = hostTime
     }
 }

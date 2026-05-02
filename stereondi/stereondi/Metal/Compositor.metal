@@ -94,6 +94,16 @@ static inline bool uv_outside_source(float2 src_uv) {
     return src_uv.x < 0.0f || src_uv.x > 1.0f;
 }
 
+// Slice #12: BGRA sources may carry an alpha channel; the receive
+// path flags them via NDIVideoFrame.hasAlpha. Per PRD's resilience
+// section ("alpha sources premultiplied against black at receive"),
+// the shader pre-multiplies unconditionally for the BGRA path:
+//   rgb' = rgb * a
+// For fully-opaque sources (a == 1) this is a no-op, so detection at
+// the per-pixel level is unnecessary — the cheap branch-free path is
+// the same code as the correct alpha path. UYVY has no alpha channel
+// and uses the unmodified `sbs_fragment_uyvy` below; this premultiply
+// applies only to the BGRA path.
 fragment half4 sbs_fragment_bgra(SbSVaryings in [[stage_in]],
                                  texture2d<half> source [[texture(0)]],
                                  constant AlignmentUniforms& alignment [[buffer(0)]]) {
@@ -103,7 +113,7 @@ fragment half4 sbs_fragment_bgra(SbSVaryings in [[stage_in]],
     }
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     half4 c = source.sample(s, src_uv);
-    return half4(c.rgb, 1.0h);
+    return half4(c.rgb * c.a, 1.0h);
 }
 
 // BT.709 limited-range YCbCr → full-range RGB. The sampled bgrg422
@@ -204,8 +214,13 @@ static inline half2 anaglyph_sample_luma(float2 uvFull,
     }
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     half4 sample = source.sample(s, float2(src_u, dst_local.y));
+    // BGRA path (decode_mode == 0) applies the same premultiply-
+    // against-black behavior as the SbS BGRA fragment shader (see
+    // sbs_fragment_bgra). UYVY (decode_mode == 1) has no alpha channel
+    // so the sample.a value is meaningless and we skip the premultiply
+    // entirely.
     half3 rgb = (side.decode_mode == 1u) ? decode_uyvy_sample_to_rgb(sample)
-                                         : sample.rgb;
+                                         : (sample.rgb * sample.a);
     return half2(luma_bt709(rgb), 1.0h);
 }
 
