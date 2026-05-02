@@ -99,11 +99,30 @@ struct BottomBar: View {
     // MARK: - Disclosure (per-eye fine sliders)
 
     private var disclosureContent: some View {
-        HStack(spacing: 24) {
-            perEyeSlider(label: "Left fine",
-                         value: $alignment.leftFineHIT)
-            perEyeSlider(label: "Right fine",
-                         value: $alignment.rightFineHIT)
+        VStack(spacing: 8) {
+            HStack(spacing: 24) {
+                perEyeSlider(label: "Left fine",
+                             value: $alignment.leftFineHIT)
+                perEyeSlider(label: "Right fine",
+                             value: $alignment.rightFineHIT)
+            }
+
+            HStack {
+                Text("Crop")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Picker("Crop mode", selection: $alignment.cropMode) {
+                    Text("Auto").tag(CropMode.auto)
+                    Text("Off").tag(CropMode.off)
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 220)
+                .accessibilityLabel("Crop mode")
+                .accessibilityValue(alignment.cropMode == .auto
+                                    ? "Auto-crop common region"
+                                    : "Full frame with black bars")
+                Spacer()
+            }
         }
         .padding(.bottom, 4)
     }
