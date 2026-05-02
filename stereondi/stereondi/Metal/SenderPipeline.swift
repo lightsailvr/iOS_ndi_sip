@@ -18,6 +18,20 @@
 //
 //  v1 frame rate: per the issue, hardcoded 60p (60000/1000). PRD
 //  source-rate matching is slice #14 territory.
+//
+//  Slice #10: stream identity (name + groups) is no longer baked in
+//  at init time. Construction allocates the GPU resources but does
+//  not start the underlying NDISender; `reconfigure(streamName:groups:)`
+//  is the single canonical "(re)create the sender with this identity"
+//  entry point. ContentView calls it once at app start (with the
+//  defaults from `OutputStreamConfig`), again whenever the operator
+//  edits the Settings sheet, and again on each scene-foreground
+//  transition (background tears the sender down via `stop()`).
+//
+//  `reconfigure` delegates to `NDISender.startWithName:groups:`, which
+//  is idempotent — it tears the existing instance down and rebuilds,
+//  so a rename mid-session is safe and does not require an explicit
+//  stop() first.
 
 import Foundation
 import Metal
@@ -37,8 +51,12 @@ final class SenderPipeline {
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
-    private let streamName: String
-    private let groups: String?
+
+    /// Last-applied identity. Retained so a scene-foreground
+    /// transition can reuse the same identity without ContentView
+    /// having to re-supply it. Nil until the first `reconfigure(...)`.
+    private var lastStreamName: String?
+    private var lastGroups: String?
 
     // 3-deep ring of UYVY buffers. Cycled on each send via `(index +
     // 1) % bufferPool.count`. .shared storage so the contents pointer
@@ -48,14 +66,9 @@ final class SenderPipeline {
     private var bufferPool: [MTLBuffer] = []
     private var bufferIndex: Int = 0
 
-    init(device: MTLDevice,
-         commandQueue: MTLCommandQueue,
-         streamName: String,
-         groups: String?) throws {
+    init(device: MTLDevice, commandQueue: MTLCommandQueue) throws {
         self.device = device
         self.commandQueue = commandQueue
-        self.streamName = streamName
-        self.groups = groups
         self.encoder = try UYVYEncoder(device: device)
         self.sender = NDISender()
 
@@ -67,8 +80,6 @@ final class SenderPipeline {
             }
             bufferPool.append(buffer)
         }
-
-        _ = sender.start(withName: streamName, groups: groups)
     }
 
     enum PipelineError: Error {
@@ -79,14 +90,27 @@ final class SenderPipeline {
         sender.isRunning
     }
 
-    /// Restart the underlying NDISender (e.g. after a scene-phase
-    /// transition back to active). Safe to call repeatedly.
-    func start() {
-        if !sender.isRunning {
-            _ = sender.start(withName: streamName, groups: groups)
-        }
+    /// Tear down the running sender and rebuild it with the supplied
+    /// identity. This is the single canonical "(re)start the NDI
+    /// output" entry point — the underlying `NDISender.startWithName:
+    /// groups:` is idempotent (it stops first, then creates), so a
+    /// rename or groups change mid-session is safe and does not
+    /// require an explicit `stop()` call beforehand.
+    ///
+    /// Safe to call from main; the sender's send-path is serialized
+    /// on its own internal `os_unfair_lock` against any in-flight GPU
+    /// completion handler.
+    func reconfigure(streamName: String, groups: String?) {
+        lastStreamName = streamName
+        lastGroups = groups
+        _ = sender.start(withName: streamName, groups: groups)
     }
 
+    /// Tear down the sender (typical: scene-background transition).
+    /// Retains `lastStreamName` / `lastGroups` so a subsequent
+    /// `reconfigure(...)` call (or, on scene-foreground, ContentView
+    /// calling `reconfigure(...)` with the current OutputStreamConfig)
+    /// can reuse the identity.
     func stop() {
         sender.stop()
     }
