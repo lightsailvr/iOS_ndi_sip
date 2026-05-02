@@ -95,6 +95,21 @@ enum ScreenMode: String, CaseIterable, Codable, Sendable {
     case channelTest
 }
 
+extension ScreenMode {
+    /// Human-readable label for the mode. Used by the SettingsSheet's
+    /// "Default mode on launch" picker (slice #14). The TopBar's
+    /// segmented control uses its own short labels so the bar fits on
+    /// an 11" iPad in landscape; this extension is for surfaces that
+    /// can afford the long form.
+    var displayName: String {
+        switch self {
+        case .sbs: return "Side-by-side"
+        case .anaglyph: return "Anaglyph (red/cyan)"
+        case .channelTest: return "Channel test"
+        }
+    }
+}
+
 @MainActor
 @Observable
 final class AlignmentState {
