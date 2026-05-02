@@ -55,6 +55,28 @@
 //     same single sheet — iOS only allows one sheet per ancestor.
 //   - Settings sheet now also gets `alignment` and `store` so the
 //     "Reset session" action and "Default mode on launch" picker work.
+//
+//  Slice #13 additions:
+//   - `EmptyState` replaces the old "Pick from the top bar" overlay
+//     when both sides are nil. Gated on `emptyStateEligible` so a
+//     persisted-pair launch doesn't flash the empty surface during
+//     the silent-auto-reconnect grace window.
+//   - `StatusRow` sits below the TopBar showing per-eye name +
+//     resolution + framerate + state-dot.
+//   - Top-edge chrome (TopBar + StatusRow + WarningBanner) auto-hides
+//     after 3 s of no operator interaction. The visibility timer is
+//     poked by single-tap on the preview gesture overlay (two-finger
+//     pan does NOT bump it — alignment sessions want hidden chrome
+//     per the issue's sanity-check section). The bottom bar is
+//     intentionally NOT bound to chromeVisible (PRD user story 24:
+//     convergence slider always visible).
+//   - `ThermalMonitor` drives a `PreviewLimitedIndicator` next to the
+//     TopBar's gear and is threaded into `MetalPreviewView` so the
+//     on-screen redraw alternates ticks while the NDI sender keeps
+//     firing every tick.
+//   - The per-eye `ReceiverStatusOverlay` for an `.empty` side is now
+//     a tap target that presents the SourcePickerSheet for that side
+//     (single-source partial preview case).
 
 import Metal
 import SwiftUI
@@ -72,6 +94,7 @@ struct ContentView: View {
     @State private var status = SessionStatus()
     @State private var network = NetworkResilience()
     @State private var watchdog: ReceiverWatchdog?
+    @State private var thermal = ThermalMonitor()
     @State private var zoom: CGFloat = 1.0
 
     @State private var compositor: StereoCompositor?
@@ -86,6 +109,36 @@ struct ContentView: View {
     /// TopBar over which sheet is on top.
     @State private var pickerSide: SourcePickerSheet.Side?
 
+    // MARK: - Slice #13 chrome auto-hide + empty-state gate
+
+    /// Visibility of the top-edge chrome stack (TopBar + StatusRow +
+    /// WarningBanner). Bumped on any single-tap on the preview
+    /// gesture overlay; reset to false after a 3 s idle window per
+    /// PRD user story 23. The bottom bar is intentionally NOT bound
+    /// to this state — convergence is always reachable.
+    @State private var chromeVisible: Bool = true
+
+    /// Long-lived MainActor task that flips `chromeVisible` to false
+    /// after the auto-hide delay. Replaced (cancelled + recreated) on
+    /// every visibility bump so a fresh tap restarts the countdown.
+    @State private var chromeHideTask: Task<Void, Never>?
+
+    /// True once enough time has passed since launch (or since both
+    /// sides were last cleared) to safely show the EmptyState. Without
+    /// this gate, a persisted-pair launch would flash the empty
+    /// surface during the silent-auto-reconnect grace window — the
+    /// operator should see the "Pick…" prompt only when the app has
+    /// genuinely settled into "no sources connectable".
+    @State private var emptyStateEligible: Bool = false
+
+    /// Auto-hide delay per PRD user story 23. 3 seconds.
+    private static let chromeAutoHideSeconds: Double = 3.0
+
+    /// Match the silent-auto-reconnect window (slice #11) so the
+    /// EmptyState surface only appears after the receiver-warm-up
+    /// grace period the rest of the app already commits to.
+    private static let emptyStateGraceSeconds: Double = 5.0
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
@@ -95,7 +148,8 @@ struct ContentView: View {
                                  compositor: compositor,
                                  device: device,
                                  alignment: alignment,
-                                 senderPipeline: senderPipeline)
+                                 senderPipeline: senderPipeline,
+                                 thermal: thermal)
                     .scaleEffect(zoom)
                     .ignoresSafeArea()
             } else if let initError {
@@ -107,40 +161,50 @@ struct ContentView: View {
                 }
             }
 
-            // Per-eye status overlays sit between the Metal preview
-            // and the gesture overlay so the "Reconnecting…" /
-            // "Stalled" / "No source" text is legible without
-            // dimming the gesture surface. Hidden when both sides
-            // are .live (the EmptyView in ReceiverStatusOverlay).
-            if let watchdog {
-                HStack(spacing: 0) {
-                    ReceiverStatusOverlay(side: .left,
-                                          status: watchdog.leftStatus)
-                    ReceiverStatusOverlay(side: .right,
-                                          status: watchdog.rightStatus)
-                }
-                .allowsHitTesting(false)
-            }
-
-            // Gesture overlay sits between the preview and the
-            // chrome bars; two-finger pans and pinches are captured
-            // here, single-finger touches fall through to the chrome.
-            PreviewGestureOverlay(alignment: alignment, zoom: $zoom)
+            // Gesture overlay sits between the Metal preview and
+            // everything tappable above it. Two-finger pans and
+            // pinches are captured here. A single-tap callback
+            // bumps the chrome visibility timer per PRD user story
+            // 23 (auto-hide after 3 s); two-finger drags do NOT bump
+            // visibility (the operator wants the bars hidden while
+            // alignment is happening — issue sanity-check section).
+            PreviewGestureOverlay(alignment: alignment,
+                                  zoom: $zoom,
+                                  onSingleTap: { bumpChromeVisibility() })
                 .ignoresSafeArea()
 
-            VStack {
-                TopBar(selection: selection,
-                       alignment: alignment,
-                       output: output,
-                       discovered: discovered,
-                       pickerSide: $pickerSide)
-                WarningBanner(status: status)
+            // Per-eye status overlays sit ABOVE the gesture overlay
+            // so the `.empty`-side tap-to-pick button (slice #13)
+            // can receive single-finger taps before the gesture
+            // overlay's tap-bumps-chrome handler. The non-tappable
+            // overlay states (.live / .connecting / .reconnecting /
+            // .stalled) render small material badges that don't
+            // intercept taps outside their content shape — taps in
+            // those regions still fall through to the gesture
+            // overlay (and bump the chrome timer).
+            if let watchdog {
+                HStack(spacing: 0) {
+                    ReceiverStatusOverlay(
+                        side: .left,
+                        status: watchdog.leftStatus,
+                        onTapEmpty: { pickerSide = .left }
+                    )
+                    ReceiverStatusOverlay(
+                        side: .right,
+                        status: watchdog.rightStatus,
+                        onTapEmpty: { pickerSide = .right }
+                    )
+                }
+            }
+
+            VStack(spacing: 4) {
+                topChrome
                 Spacer()
                 BottomBar(alignment: alignment)
             }
 
-            if selection.leftSource == nil && selection.rightSource == nil {
-                searchOverlay
+            if showEmptyState {
+                EmptyState(pickerSide: $pickerSide)
             }
         }
         .sheet(item: $pickerSide) { side in
@@ -154,15 +218,23 @@ struct ContentView: View {
         }
         .onAppear {
             initializeRenderer()
+            // Ensure the chrome is visible on first appear and start
+            // the auto-hide countdown.
+            bumpChromeVisibility()
         }
         .task {
             await silentAutoReconnect()
+        }
+        .task {
+            await openEmptyStateGate()
         }
         .onDisappear {
             pairer?.stop()
             senderPipeline?.stop()
             watchdog?.stop()
             network.stop()
+            chromeHideTask?.cancel()
+            chromeHideTask = nil
         }
         .onChange(of: selection.leftSource) { _, newLeft in
             apply(source: newLeft, to: receiverLeft)
@@ -177,6 +249,19 @@ struct ContentView: View {
         .onChange(of: output.effectiveGroups) { _, newGroups in
             senderPipeline?.reconfigure(streamName: output.effectiveStreamName,
                                         groups: newGroups)
+        }
+        .onChange(of: pickerSide) { _, newSide in
+            // Sheets keep the chrome visible — the operator just
+            // dismissed the picker, they need to see the bars to take
+            // their next action. Cancel the hide timer while a sheet
+            // is up; restart on dismissal.
+            if newSide != nil {
+                chromeHideTask?.cancel()
+                chromeHideTask = nil
+                chromeVisible = true
+            } else {
+                bumpChromeVisibility()
+            }
         }
         .onChange(of: scenePhase) { _, newPhase in
             switch newPhase {
@@ -197,13 +282,80 @@ struct ContentView: View {
         }
     }
 
-    private var searchOverlay: some View {
-        VStack(spacing: 8) {
-            ProgressView()
-            Text("Pick Left and Right sources from the top bar")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+    // MARK: - Top chrome (auto-hides per PRD user story 23)
+
+    private var topChrome: some View {
+        VStack(spacing: 4) {
+            HStack(spacing: 8) {
+                TopBar(selection: selection,
+                       alignment: alignment,
+                       output: output,
+                       discovered: discovered,
+                       pickerSide: $pickerSide)
+                PreviewLimitedIndicator(thermal: thermal)
+                    .padding(.trailing, 8)
+            }
+            StatusRow(selection: selection, watchdog: watchdog)
+            WarningBanner(status: status)
         }
+        .opacity(chromeVisible ? 1 : 0)
+        .animation(.easeInOut(duration: 0.2), value: chromeVisible)
+        // When hidden, the chrome must not eat taps — let them fall
+        // through to the gesture overlay (which bumps visibility on
+        // single-tap, surfacing the chrome again).
+        .allowsHitTesting(chromeVisible)
+    }
+
+    /// Whether the EmptyState surface should be mounted right now.
+    /// True iff:
+    ///   - both sides are nil (operator has no sources picked), AND
+    ///   - the empty-state grace window has elapsed.
+    /// Without the second clause, a persisted-pair launch would flash
+    /// the EmptyState briefly while the receivers warm up.
+    private var showEmptyState: Bool {
+        return emptyStateEligible
+            && selection.leftSource == nil
+            && selection.rightSource == nil
+    }
+
+    // MARK: - Chrome auto-hide
+
+    /// Mark the chrome visible and (re-)start the 3 s hide countdown.
+    /// Called on appear, on any single-tap on the gesture overlay,
+    /// and after the source-picker sheet is dismissed.
+    private func bumpChromeVisibility() {
+        chromeVisible = true
+        chromeHideTask?.cancel()
+        chromeHideTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .seconds(Self.chromeAutoHideSeconds))
+            } catch {
+                return
+            }
+            if Task.isCancelled { return }
+            // Don't auto-hide while a sheet is up — the operator
+            // dismissing the sheet will re-arm the timer.
+            guard pickerSide == nil else { return }
+            // Don't auto-hide while the operator has no sources
+            // picked — the chrome (and the EmptyState surface, once
+            // its grace window opens) IS the UI in that state. We
+            // also keep the chrome visible during the empty-state
+            // grace window so cold launch doesn't briefly show a
+            // black screen with no surfaces.
+            guard selection.leftSource != nil || selection.rightSource != nil else { return }
+            chromeVisible = false
+        }
+    }
+
+    // MARK: - Empty state grace window
+
+    /// Wait `emptyStateGraceSeconds` after launch before letting the
+    /// EmptyState surface appear. This matches the silent-auto-
+    /// reconnect window (slice #11) so a persisted-pair launch
+    /// doesn't flash the empty surface during the warm-up window.
+    private func openEmptyStateGate() async {
+        try? await Task.sleep(for: .seconds(Self.emptyStateGraceSeconds))
+        emptyStateEligible = true
     }
 
     private func initializeRenderer() {
@@ -280,6 +432,12 @@ struct ContentView: View {
     /// no persisted selection (cold first launch) there's nothing to
     /// reconnect to — present the picker immediately rather than
     /// waste 5 s of staring at the search overlay.
+    ///
+    /// Slice #13: cold-launch path no longer auto-presents the
+    /// picker. The EmptyState surface (mounted after the empty-
+    /// state grace window elapses) carries the prompt. Operators
+    /// can tap one of the EmptyState pick buttons to open the picker
+    /// when they're ready.
     private func silentAutoReconnect() async {
         // SwiftUI .onChange doesn't fire on the initial value, so
         // explicitly drive the receivers from the restored selection.
@@ -289,7 +447,9 @@ struct ContentView: View {
         apply(source: selection.rightSource, to: receiverRight)
 
         guard selection.leftSource != nil || selection.rightSource != nil else {
-            pickerSide = .left
+            // Cold launch: don't auto-present the picker; the
+            // EmptyState surface (via openEmptyStateGate) will
+            // surface the pick buttons.
             return
         }
 
