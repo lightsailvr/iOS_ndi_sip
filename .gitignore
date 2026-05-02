@@ -45,3 +45,4 @@ fastlane/test_output
 
 # Claude Code — per-developer local overrides (project-shared settings.json is fine to commit)
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
