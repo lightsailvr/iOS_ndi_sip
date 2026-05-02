@@ -199,4 +199,36 @@ struct AlignmentStateTests {
         #expect(state.convergence == 0)
         #expect(state.swapEyes == true)
     }
+
+    // MARK: - Slice #9: screenMode/swapEyes interaction (top-bar UI)
+
+    @Test
+    func switchingToAnaglyphPreservesSwapEyes() {
+        // The slice-#9 TopBar only mounts the swap-eyes toggle when
+        // screenMode == .anaglyph. The operator may set swap-eyes once
+        // (e.g. while testing glasses) and then move through SbS for a
+        // creative-look pass before returning to anaglyph for fine
+        // alignment — switching modes must never silently flip the
+        // swap-eyes preference.
+        let state = AlignmentState()
+        state.swapEyes = true
+        state.screenMode = .anaglyph
+        #expect(state.swapEyes == true)
+    }
+
+    @Test
+    func swapEyesSurvivesScreenModeRoundTrip() {
+        // Same invariant as above, exercised across a full
+        // anaglyph → channel-test → sbs → anaglyph round trip. The
+        // swap-eyes preference is glasses-orientation, not view-state,
+        // so it must remain stable as the operator iterates between
+        // modes that ignore it.
+        let state = AlignmentState()
+        state.screenMode = .anaglyph
+        state.swapEyes = true
+        state.screenMode = .channelTest
+        state.screenMode = .sbs
+        state.screenMode = .anaglyph
+        #expect(state.swapEyes == true)
+    }
 }
