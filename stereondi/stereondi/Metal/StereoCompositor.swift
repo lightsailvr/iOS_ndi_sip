@@ -1,20 +1,34 @@
 //  StereoCompositor.swift
 //
-//  Slice #4 stereo compositor — renders a side-by-side composite of
-//  two VideoFrameSources into a target Metal texture. One mode only:
-//  zero-HIT SbS, no anaglyph, no channel test, no crop math. Slices
-//  #6 / #7 extend this with HIT/crop and the alignment / channel-test
-//  modes; the per-side draw structure is the seam they bolt onto.
+//  Stereo SbS compositor. Each per-eye draw call covers an aspect-fit
+//  half of the target with a triangle strip; the fragment shader maps
+//  destination UV ∈ [0,1] into the auto-crop "common region" of source
+//  UV ∈ [0,1]. The hardware bilinear filter on the source sampler
+//  delivers sub-pixel sampling for free, which is how HIT achieves its
+//  0.1 px specified resolution.
 //
 //  Two pipelines because UYVY and BGRA need different fragment shaders
 //  (UYVY samples through the bgrg422-format hardware chroma upsampler
 //  and decodes BT.709 limited-range in-shader). Pipeline selection is
 //  per-side; the operator can mix BGRA and UYVY sources for free.
 //
+//  Slice #6 additions:
+//   - `AlignmentUniforms` carries (u_min, u_max) per side. The shader
+//     samples `dst_uv.x → u_min + dst_uv.x * (u_max - u_min)`.
+//   - The CPU computes (u_min, u_max) per eye by combining the eye's
+//     own HIT offset (in source pixels → normalized U) with the
+//     "common region" crop amount, which is `max(|leftHIT|, |rightHIT|)`
+//     normalized by source width. With auto-crop ON (the only mode in
+//     this slice), the resulting source UV stays in [0,1] for all
+//     dst_uv.x in [0,1] — no black bars.
+//
+//  Slice #7 will add a crop-OFF mode by zeroing out the per-side
+//  cropping term and letting the shader's u_outside_source check
+//  produce black bars where the offset overshoots.
+//
 //  The MTLTexture handed to render() is owned by the caller (typically
 //  an MTKView's currentDrawable). We do not present or commit; the
-//  caller does. This keeps the compositor reusable for the future
-//  CPU-readback path the NDI sender will use in slice #9.
+//  caller does.
 
 import CoreVideo
 import Foundation
@@ -37,6 +51,18 @@ final class StereoCompositor {
     /// Height of the offscreen render target consumed by the NDI
     /// sender pipeline. Per PRD: v1 always outputs 1920×1080 SbS.
     static let senderOutputHeight = 1080
+
+    /// Per-side fragment-shader buffer-0 contents. Layout MUST stay in
+    /// sync with the `AlignmentUniforms` struct in `Compositor.metal`.
+    /// `reservedCrop` is unused this slice; slice #7 repurposes it as
+    /// a mode flag and adds a `_padding` field — the Swift struct
+    /// already reserves the padding so the layout doesn't shift later.
+    struct AlignmentUniforms {
+        var uMin: Float
+        var uMax: Float
+        var reservedCrop: Float = 0
+        var padding: Float = 0
+    }
 
     private let device: MTLDevice
     private let vertexFunction: MTLFunction
@@ -77,11 +103,16 @@ final class StereoCompositor {
         self.textureCache = cache
     }
 
-    /// Render the SbS composite of `pair` into `target`. The target's
-    /// loadAction is .clear (black); a nil pair (or nil eye) draws no
-    /// geometry for that half, so the cleared black shows through —
-    /// this is also the fallback when the format isn't BGRA/UYVY.
+    /// Render the SbS composite of `pair` into `target`, using `alignment`
+    /// for per-eye HIT + auto-crop. The target's loadAction is .clear
+    /// (black); a nil pair (or nil eye) draws no geometry for that
+    /// half so the cleared black shows through.
+    ///
+    /// `alignment` is read fresh per call — the compositor never caches
+    /// values from prior frames, so a slider drag or a two-finger pan
+    /// reflects in the very next rendered frame.
     func render(pair: StereoFramePair,
+                alignment: AlignmentState,
                 into target: MTLTexture,
                 commandBuffer: MTLCommandBuffer) {
         let pass = MTLRenderPassDescriptor()
@@ -94,18 +125,26 @@ final class StereoCompositor {
             return
         }
 
+        // Snapshot the values once per frame. The reads still happen on
+        // MainActor (this method is @MainActor) but capturing into
+        // locals avoids two property accesses per side and makes the
+        // common-region math obviously consistent across eyes.
+        let leftHIT = alignment.leftHIT
+        let rightHIT = alignment.rightHIT
+
         // Hold CVMetalTextures alive until GPU completion. The MTLTexture
         // returned via CVMetalTextureGetTexture aliases the IOSurface
         // backing; if the CVMetalTexture wrapper is released before the
-        // GPU is done sampling, the IOSurface can be recycled. Capturing
-        // the array in the completed-handler closure is the standard
-        // CV/Metal lifetime pattern.
+        // GPU is done sampling, the IOSurface can be recycled.
         var inflight: [CVMetalTexture] = []
 
         if let leftFrame = pair.left,
            let drawn = drawSide(encoder: encoder,
                                 frame: leftFrame,
                                 side: .left,
+                                hitPixels: leftHIT,
+                                otherHitPixels: rightHIT,
+                                otherFrameWidth: pair.right?.width,
                                 targetWidth: target.width,
                                 targetHeight: target.height,
                                 targetPixelFormat: target.pixelFormat) {
@@ -116,6 +155,9 @@ final class StereoCompositor {
            let drawn = drawSide(encoder: encoder,
                                 frame: rightFrame,
                                 side: .right,
+                                hitPixels: rightHIT,
+                                otherHitPixels: leftHIT,
+                                otherFrameWidth: pair.left?.width,
                                 targetWidth: target.width,
                                 targetHeight: target.height,
                                 targetPixelFormat: target.pixelFormat) {
@@ -137,11 +179,12 @@ final class StereoCompositor {
     /// buffer and reads the result back via a completion handler.
     /// Returns nil if the offscreen target couldn't be allocated.
     func renderForSender(pair: StereoFramePair,
+                         alignment: AlignmentState,
                          commandBuffer: MTLCommandBuffer) -> MTLTexture? {
         guard let target = ensureSenderTarget() else {
             return nil
         }
-        render(pair: pair, into: target, commandBuffer: commandBuffer)
+        render(pair: pair, alignment: alignment, into: target, commandBuffer: commandBuffer)
         return target
     }
 
@@ -171,10 +214,47 @@ final class StereoCompositor {
         case right
     }
 
+    /// Compute per-eye `(u_min, u_max)` in source-UV space for the
+    /// auto-crop common-region mode.
+    ///
+    /// The window samples a slice of the source equal in width to
+    /// `1 - 2 * commonAbsUV`, where `commonAbsUV` is `max(|leftHIT|,
+    /// |rightHIT|)` normalized by source width. The slice is centered
+    /// around `0.5 + hitUV` so HIT translates the visible source
+    /// region by the correct amount, and the slice's edges are
+    /// guaranteed to stay inside [0,1] because the eye with the larger
+    /// |HIT| still has `commonAbsUV` of headroom on its outside edge.
+    ///
+    /// When both HITs are zero, this collapses to (u_min=0, u_max=1) —
+    /// the existing zero-HIT golden test continues to pass unchanged.
+    static func alignmentUniforms(forSideHITPixels hit: Double,
+                                  otherSideHITPixels otherHit: Double,
+                                  sourceWidthPixels: Int,
+                                  otherSourceWidthPixels: Int?) -> AlignmentUniforms {
+        let srcW = Double(max(sourceWidthPixels, 1))
+        let hitUV = AlignmentMath.hitToUVOffset(hitPixels: hit, sourceWidthPixels: srcW)
+
+        // Compute the cross-eye max in normalized UV, using each eye's
+        // own source width. When the other eye's frame is missing or
+        // its width is unknown, fall back to this eye's width so the
+        // lone-eye case still gets sensible cropping.
+        let otherWidth = Double(max(otherSourceWidthPixels ?? sourceWidthPixels, 1))
+        let otherHitUV = AlignmentMath.hitToUVOffset(hitPixels: otherHit,
+                                                     sourceWidthPixels: otherWidth)
+        let commonAbsUV = max(abs(hitUV), abs(otherHitUV))
+
+        let uMin = commonAbsUV + hitUV
+        let uMax = (1.0 - commonAbsUV) + hitUV
+        return AlignmentUniforms(uMin: Float(uMin), uMax: Float(uMax))
+    }
+
     @discardableResult
     private func drawSide(encoder: MTLRenderCommandEncoder,
                           frame: any VideoFrameSource,
                           side: Side,
+                          hitPixels: Double,
+                          otherHitPixels: Double,
+                          otherFrameWidth: Int?,
                           targetWidth: Int,
                           targetHeight: Int,
                           targetPixelFormat: MTLPixelFormat) -> CVMetalTexture? {
@@ -204,7 +284,6 @@ final class StereoCompositor {
             cvTexture = tex
             sourceKind = .uyvy
         default:
-            // Unsupported FourCC: no geometry → cleared black shows.
             return nil
         }
 
@@ -220,10 +299,18 @@ final class StereoCompositor {
                                          side: side)
         var verts = Self.quadVertices(for: rect)
 
+        var uniforms = Self.alignmentUniforms(forSideHITPixels: hitPixels,
+                                              otherSideHITPixels: otherHitPixels,
+                                              sourceWidthPixels: frame.width,
+                                              otherSourceWidthPixels: otherFrameWidth)
+
         encoder.setRenderPipelineState(pipelineState)
         encoder.setVertexBytes(&verts,
                                length: MemoryLayout<SbSVertex>.stride * verts.count,
                                index: 0)
+        encoder.setFragmentBytes(&uniforms,
+                                 length: MemoryLayout<AlignmentUniforms>.stride,
+                                 index: 0)
         encoder.setFragmentTexture(metalTexture, index: 0)
         encoder.drawPrimitives(type: .triangleStrip,
                                vertexStart: 0,
