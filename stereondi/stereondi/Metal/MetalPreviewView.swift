@@ -14,6 +14,13 @@
 //  on-screen draw and the optional SenderPipeline. The Coordinator
 //  holds a reference (not a copy) so a slider drag or a two-finger
 //  pan reflects in the very next rendered frame.
+//
+//  Slice #8: the on-screen draw routes through `renderScreen(...)`
+//  which honors `alignment.screenMode` (.sbs / .anaglyph /
+//  .channelTest); the SenderPipeline keeps calling
+//  `renderForSender(...)` which is always SbS, so the iPad operator
+//  can flip into anaglyph or channel-test without disturbing the
+//  Quest viewer's stream.
 
 import Metal
 import MetalKit
@@ -122,10 +129,10 @@ struct MetalPreviewView: UIViewRepresentable {
                 return
             }
 
-            compositor.render(pair: latestPair,
-                              alignment: alignment,
-                              into: drawable.texture,
-                              commandBuffer: commandBuffer)
+            compositor.renderScreen(pair: latestPair,
+                                    alignment: alignment,
+                                    into: drawable.texture,
+                                    commandBuffer: commandBuffer)
 
             commandBuffer.present(drawable)
             commandBuffer.commit()
