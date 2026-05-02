@@ -66,7 +66,9 @@ struct ContentView: View {
                 .ignoresSafeArea()
 
             VStack {
-                TopBar(selection: selection, discovered: discovered)
+                TopBar(selection: selection,
+                       alignment: alignment,
+                       discovered: discovered)
                 Spacer()
                 BottomBar(alignment: alignment)
             }
