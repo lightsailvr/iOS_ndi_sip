@@ -24,12 +24,31 @@
 //  silent — the UI doesn't need to disable the per-eye fine sliders
 //  when their effect would push past the limit.
 //
-//  Slice scope: convergence, per-eye fine, reset, nudge. Crop toggle,
-//  preview-mode (SbS / anaglyph / channel-test), and swap-eyes live
-//  in this same model in slice #7 — extending here is intentional.
+//  Slice scope: convergence, per-eye fine, reset, nudge, crop toggle.
+//  Preview-mode (SbS / anaglyph / channel-test) and swap-eyes live in
+//  this same model in later slices — extending here is intentional.
 
 import Foundation
 import Observation
+
+/// How the per-eye sampling window is computed in the compositor.
+///
+/// - `.auto`: both eyes are cropped by the maximum absolute HIT offset
+///   (in normalized UV) and the source slice is rescaled across the
+///   eye's destination half. The operator sees a clean, full-bleed
+///   image with no black bars regardless of HIT magnitude.
+/// - `.off`: each eye samples its native `[hitUV, hitUV + 1]` window;
+///   the shader returns black for source-UV outside `[0, 1]`, so the
+///   missing-edge region becomes a visible black bar that lets the
+///   operator see exactly what HIT is doing.
+///
+/// Default (auto) matches PRD user story 13: "the operator sees a
+/// clean image with no black bars" while still allowing them to
+/// flip the toggle to verify what HIT is shifting.
+enum CropMode: String, CaseIterable, Sendable {
+    case auto
+    case off
+}
 
 @MainActor
 @Observable
@@ -62,6 +81,12 @@ final class AlignmentState {
         }
     }
 
+    /// Per-PRD default: auto-crop is ON so the operator's resting view
+    /// is clean. The bottom-bar disclosure exposes a toggle that flips
+    /// this to `.off` for diagnostic / "show me exactly what HIT is
+    /// doing" use.
+    var cropMode: CropMode = .auto
+
     /// Effective per-eye HIT in source pixels (sub-pixel precision
     /// preserved). Compositor reads this fresh on every frame.
     var leftHIT: Double {
@@ -80,6 +105,13 @@ final class AlignmentState {
         convergence = 0
         leftFineHIT = 0
         rightFineHIT = 0
+    }
+
+    /// Flips the crop mode between `.auto` and `.off`. The toggle is
+    /// not reset by `resetAll()` — operators frequently adjust HIT
+    /// while leaving the crop preference in place.
+    func toggleCrop() {
+        cropMode = (cropMode == .auto) ? .off : .auto
     }
 
     /// Bumps convergence by `delta` (typically ±1 or ±0.1 px). Sub-pixel

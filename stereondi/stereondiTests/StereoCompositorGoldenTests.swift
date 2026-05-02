@@ -1,21 +1,27 @@
 //  StereoCompositorGoldenTests.swift
 //
-//  Five reference goldens for the SbS compositor:
+//  Reference goldens for the SbS compositor:
 //
 //   1. zero-HIT SbS gradient (slice #4 baseline) — `sbs_zero_hit_gradient.png`
-//   2. +50 px convergence  — `sbs_hit_p50.png`
-//   3. −50 px convergence  — `sbs_hit_n50.png`
-//   4. +200 px convergence — `sbs_hit_p200.png`
-//   5. +0.3 px sub-pixel convergence — `sbs_hit_p0_3.png`
+//   2. +50 px convergence, AUTO crop — `sbs_hit_p50_crop_auto.png`
+//   3. +50 px convergence, OFF  crop — `sbs_hit_p50_crop_off.png`
+//   4. −50 px convergence (auto) — `sbs_hit_n50.png`
+//   5. +200 px convergence (auto) — `sbs_hit_p200.png`
+//   6. +0.3 px sub-pixel convergence (auto) — `sbs_hit_p0_3.png`
 //
-//  Each renders the same red-left / blue-right gradient pair but with
-//  the AlignmentState's convergence dialed to the listed value, then
-//  either compares against the bundled reference PNG (default) or
+//  Each renders the same red-left / blue-right gradient pair with the
+//  AlignmentState's convergence + cropMode dialed to the listed value,
+//  then either compares against the bundled reference PNG (default) or
 //  rewrites it (when STEREONDI_UPDATE_GOLDENS=1).
 //
+//  Slice #7 renames the slice-#6 `sbs_hit_p50.png` → `sbs_hit_p50_crop_auto.png`
+//  (auto-crop was the implicit slice-#6 behavior) and adds the OFF
+//  variant. Other slice-#6 goldens stay under their old names because
+//  they're rendered with the default `.auto` mode.
+//
 //  The first test run on a developer Mac will fail with
-//  GoldenImageError.missingReference for the four new HIT goldens —
-//  set STEREONDI_UPDATE_GOLDENS=1 once and re-run to seed them.
+//  GoldenImageError.missingReference for any unseeded golden — set
+//  STEREONDI_UPDATE_GOLDENS=1 once and re-run to seed them.
 //
 //  See stereondiTests/Goldens/README.md for the workflow.
 
@@ -34,8 +40,22 @@ struct StereoCompositorGoldenTests {
     }
 
     @Test
-    func hitPositive50() throws {
-        try renderAndCompare(named: "sbs_hit_p50", convergence: 50)
+    func hitPositive50CropAuto() throws {
+        try renderAndCompare(named: "sbs_hit_p50_crop_auto",
+                             convergence: 50,
+                             cropMode: .auto)
+    }
+
+    @Test
+    func hitPositive50CropOff() throws {
+        // OFF mode at +50 px convergence: each eye samples
+        // [hitUV, hitUV + 1] of its source. The shader returns black
+        // outside [0, 1], so a thin black bar appears on one edge of
+        // each half (the right edge of the left eye, the left edge of
+        // the right eye — both on the inside of the SbS pair).
+        try renderAndCompare(named: "sbs_hit_p50_crop_off",
+                             convergence: 50,
+                             cropMode: .off)
     }
 
     @Test
@@ -56,7 +76,8 @@ struct StereoCompositorGoldenTests {
     // MARK: - Test harness
 
     private func renderAndCompare(named referenceName: String,
-                                  convergence: Double) throws {
+                                  convergence: Double,
+                                  cropMode: CropMode = .auto) throws {
         let device = try MetalRenderUtilities.makeDevice()
         let queue = try MetalRenderUtilities.makeCommandQueue(device: device)
         let target = try MetalRenderUtilities.makeRenderTarget(device: device)
@@ -69,6 +90,7 @@ struct StereoCompositorGoldenTests {
 
         let alignment = AlignmentState()
         alignment.convergence = convergence
+        alignment.cropMode = cropMode
 
         let compositor = try StereoCompositor(device: device)
         let pair = StereoFramePair(left: leftFrame, right: rightFrame, hostTime: 0)

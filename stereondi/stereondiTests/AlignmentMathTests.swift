@@ -85,9 +85,11 @@ struct AlignmentMathTests {
         let u = StereoCompositor.alignmentUniforms(forSideHITPixels: 0,
                                                    otherSideHITPixels: 0,
                                                    sourceWidthPixels: 1920,
-                                                   otherSourceWidthPixels: 1920)
+                                                   otherSourceWidthPixels: 1920,
+                                                   cropMode: .auto)
         #expect(u.uMin == 0)
         #expect(u.uMax == 1)
+        #expect(u.cropModeFlag == 0)
     }
 
     @Test
@@ -102,12 +104,14 @@ struct AlignmentMathTests {
             forSideHITPixels: leftPx,
             otherSideHITPixels: rightPx,
             sourceWidthPixels: widthPx,
-            otherSourceWidthPixels: widthPx)
+            otherSourceWidthPixels: widthPx,
+            cropMode: .auto)
         let rightU = StereoCompositor.alignmentUniforms(
             forSideHITPixels: rightPx,
             otherSideHITPixels: leftPx,
             sourceWidthPixels: widthPx,
-            otherSourceWidthPixels: widthPx)
+            otherSourceWidthPixels: widthPx,
+            cropMode: .auto)
 
         let absUV = Float(abs(leftPx) / Double(widthPx))
         // Left eye: uMin = absUV + (-absUV) = 0,  uMax = (1 - absUV) + (-absUV) = 1 - 2*absUV
@@ -129,7 +133,8 @@ struct AlignmentMathTests {
             forSideHITPixels: leftPx,
             otherSideHITPixels: rightPx,
             sourceWidthPixels: widthPx,
-            otherSourceWidthPixels: widthPx)
+            otherSourceWidthPixels: widthPx,
+            cropMode: .auto)
         let common = Float(50.0 / 960.0)
         let leftHitUV = Float(50.0 / 960.0)
         #expect(abs(leftU.uMin - (common + leftHitUV)) < 1e-7)
@@ -137,5 +142,114 @@ struct AlignmentMathTests {
         // Far edge sits at exactly 1.0 because this eye carries the
         // larger absolute HIT.
         #expect(abs(leftU.uMax - 1) < 1e-7)
+    }
+
+    @Test
+    func uniformsCropOffSetsFlag() {
+        let u = StereoCompositor.alignmentUniforms(forSideHITPixels: 50,
+                                                   otherSideHITPixels: -50,
+                                                   sourceWidthPixels: 1920,
+                                                   otherSourceWidthPixels: 1920,
+                                                   cropMode: .off)
+        // OFF mode: window is exactly [hitUV, hitUV + 1].
+        let hitUV = Float(50.0 / 1920.0)
+        #expect(abs(u.uMin - hitUV) < 1e-7)
+        #expect(abs(u.uMax - (hitUV + 1.0)) < 1e-7)
+        #expect(u.cropModeFlag == 1)
+    }
+
+    // MARK: - uvWindow (crop-mode-aware sampling window)
+
+    @Test
+    func uvWindowAutoSymmetricHIT() {
+        // Both eyes carry equal-and-opposite HIT, so commonAbsUV equals
+        // |hitUV| and the window for THIS eye is shifted to put its
+        // outside edge at exactly 1.0 (it's the eye with the larger
+        // positive HIT — the right eye in slice #6's convention).
+        let w = AlignmentMath.uvWindow(hitPixels: 50,
+                                       otherHitPixels: -50,
+                                       sourceWidthPixels: 1920,
+                                       otherSourceWidthPixels: 1920,
+                                       cropMode: .auto)
+        let hitUV = 50.0 / 1920.0
+        // commonAbsUV = 50/1920; uMin = commonAbsUV + hitUV = 2*hitUV.
+        #expect(abs(w.uMin - 2 * hitUV) < 1e-12)
+        // uMax = (1 - commonAbsUV) + hitUV = 1.
+        #expect(abs(w.uMax - 1.0) < 1e-12)
+    }
+
+    @Test
+    func uvWindowOffSymmetricHIT() {
+        // OFF: uMin = hitUV, uMax = hitUV + 1 — independent of the
+        // other eye's HIT (so the missing-edge black bar shows up
+        // outside [0, 1]).
+        let w = AlignmentMath.uvWindow(hitPixels: 50,
+                                       otherHitPixels: -50,
+                                       sourceWidthPixels: 1920,
+                                       otherSourceWidthPixels: 1920,
+                                       cropMode: .off)
+        let hitUV = 50.0 / 1920.0
+        #expect(abs(w.uMin - hitUV) < 1e-12)
+        #expect(abs(w.uMax - (hitUV + 1.0)) < 1e-12)
+        // Width is always 1 in OFF mode (no rescaling).
+        #expect(abs((w.uMax - w.uMin) - 1.0) < 1e-12)
+    }
+
+    @Test
+    func uvWindowAutoMismatchedWidthsUsesPerEyeNormalization() {
+        // hit: 50 / 1920, other: 50 / 960. |hitUV| = 50/1920 ≈ 0.026,
+        // |otherHitUV| = 50/960 ≈ 0.052 → commonAbsUV = 50/960.
+        let w = AlignmentMath.uvWindow(hitPixels: 50,
+                                       otherHitPixels: 50,
+                                       sourceWidthPixels: 1920,
+                                       otherSourceWidthPixels: 960,
+                                       cropMode: .auto)
+        let hitUV = 50.0 / 1920.0
+        let commonAbsUV = 50.0 / 960.0
+        #expect(abs(w.uMin - (commonAbsUV + hitUV)) < 1e-12)
+        #expect(abs(w.uMax - ((1.0 - commonAbsUV) + hitUV)) < 1e-12)
+    }
+
+    @Test
+    func uvWindowAutoZeroHITIsFullSource() {
+        let w = AlignmentMath.uvWindow(hitPixels: 0,
+                                       otherHitPixels: 0,
+                                       sourceWidthPixels: 1920,
+                                       otherSourceWidthPixels: 1920,
+                                       cropMode: .auto)
+        #expect(w.uMin == 0)
+        #expect(w.uMax == 1)
+    }
+
+    @Test
+    func uvWindowOffZeroHITIsFullSource() {
+        // With zero HIT both modes collapse to the same (0, 1) window —
+        // the OFF mode's "show me the black bars" only differs from
+        // AUTO when HIT is non-zero.
+        let w = AlignmentMath.uvWindow(hitPixels: 0,
+                                       otherHitPixels: 0,
+                                       sourceWidthPixels: 1920,
+                                       otherSourceWidthPixels: 1920,
+                                       cropMode: .off)
+        #expect(w.uMin == 0)
+        #expect(w.uMax == 1)
+    }
+
+    @Test
+    func uvWindowOffNegativeHITPushesUMinNegative() {
+        // hit: -50 / 1920 → window = [-50/1920, 1 - 50/1920]. The
+        // shader's uv_outside_source check will return black for
+        // src_u < 0 — that's the black bar on the LEFT edge of this
+        // eye.
+        let w = AlignmentMath.uvWindow(hitPixels: -50,
+                                       otherHitPixels: 0,
+                                       sourceWidthPixels: 1920,
+                                       otherSourceWidthPixels: 1920,
+                                       cropMode: .off)
+        let hitUV = -50.0 / 1920.0
+        #expect(abs(w.uMin - hitUV) < 1e-12)
+        #expect(abs(w.uMax - (hitUV + 1.0)) < 1e-12)
+        #expect(w.uMin < 0)
+        #expect(w.uMax < 1)
     }
 }
