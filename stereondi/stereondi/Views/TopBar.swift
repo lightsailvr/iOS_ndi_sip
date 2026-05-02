@@ -1,13 +1,25 @@
 //  TopBar.swift
 //
-//  Top horizontal bar over the live preview. Shows two source-picker
-//  dropdowns (Left, Right), a Swap button between them, and a disabled
-//  Settings gear placeholder. Tapping a dropdown opens a
-//  SourcePickerSheet bound to that side's selection.
+//  Top horizontal bar over the live preview. Shows the two source-picker
+//  dropdowns (Left, Right), a Swap button between them, the iPad
+//  screen-mode segmented control (SbS / Anaglyph / Channel Test), an
+//  overflow menu that surfaces the swap-eyes toggle when in anaglyph
+//  mode, and a disabled Settings gear placeholder.
 //
-//  Slice #3 wires only the Left source through to the live preview;
-//  Right is shown so the operator can pre-pick the second source ahead
-//  of the dual-receiver / FramePairer slice.
+//  Slice #3 wired the source pickers and the Swap button.
+//  Slice #6 added the bottom-bar HIT controls (no TopBar change).
+//  Slice #8 added the screen-mode + swap-eyes state to AlignmentState
+//  and put a temporary debug menu in the BottomBar; slice #9 supersedes
+//  that with the proper segmented control here. The NDI-output pipeline
+//  is unaffected by screen-mode changes — `StereoCompositor`
+//  `renderForSender(...)` is hard-wired to SbS regardless.
+//
+//  The overflow menu is only mounted when `screenMode == .anaglyph` so
+//  the swap-eyes toggle is hidden in modes where it has no effect (this
+//  matches the AlignmentState contract: swapEyes is a no-op outside
+//  anaglyph). When not in anaglyph, the bar collapses cleanly: the
+//  segmented control sits between the source pickers (with a flexible
+//  spacer on each side) and the gear.
 //
 //  Auto-hide-after-3s behavior is intentionally deferred to slice #13;
 //  this bar is always visible.
@@ -16,6 +28,7 @@ import SwiftUI
 
 struct TopBar: View {
     @Bindable var selection: SourceSelection
+    @Bindable var alignment: AlignmentState
     var discovered: DiscoveredSources
 
     @State private var presentingPickerForSide: SourcePickerSheet.Side?
@@ -36,6 +49,15 @@ struct TopBar: View {
             .accessibilityLabel("Swap left and right")
 
             sourceButton(side: .right, source: selection.rightSource)
+
+            Spacer(minLength: 8)
+
+            screenModePicker
+                .frame(maxWidth: 320)
+
+            if alignment.screenMode == .anaglyph {
+                overflowMenu
+            }
 
             Spacer(minLength: 8)
 
@@ -60,6 +82,42 @@ struct TopBar: View {
             )
         }
     }
+
+    // MARK: - Screen-mode segmented control
+
+    private var screenModePicker: some View {
+        Picker("Screen mode", selection: $alignment.screenMode) {
+            Text("SbS").tag(ScreenMode.sbs)
+            Text("Anaglyph").tag(ScreenMode.anaglyph)
+            Text("Channel Test").tag(ScreenMode.channelTest)
+        }
+        .pickerStyle(.segmented)
+        .accessibilityLabel("iPad screen mode")
+        .accessibilityValue(screenModeAccessibilityValue)
+    }
+
+    private var screenModeAccessibilityValue: String {
+        switch alignment.screenMode {
+        case .sbs: return "Side by side"
+        case .anaglyph: return "Anaglyph"
+        case .channelTest: return "Channel test"
+        }
+    }
+
+    // MARK: - Anaglyph overflow menu (swap-eyes lives here)
+
+    private var overflowMenu: some View {
+        Menu {
+            Toggle("Swap eyes", isOn: $alignment.swapEyes)
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.title3)
+        }
+        .menuStyle(.borderlessButton)
+        .accessibilityLabel("Anaglyph options")
+    }
+
+    // MARK: - Source pickers
 
     private func sourceButton(side: SourcePickerSheet.Side, source: NDISource?) -> some View {
         Button {
