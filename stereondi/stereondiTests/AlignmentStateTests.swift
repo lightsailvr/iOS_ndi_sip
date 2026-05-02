@@ -115,4 +115,27 @@ struct AlignmentStateTests {
         #expect(state.leftHIT == 0)
         #expect(state.rightHIT == 0)
     }
+
+    @Test
+    func cropToggle() {
+        let state = AlignmentState()
+        #expect(state.cropMode == .auto)
+        state.toggleCrop()
+        #expect(state.cropMode == .off)
+        state.toggleCrop()
+        #expect(state.cropMode == .auto)
+    }
+
+    @Test
+    func resetAllPreservesCropMode() {
+        // resetAll() zeros HIT but intentionally leaves cropMode in
+        // place — operators frequently reset alignment mid-take while
+        // keeping their preferred crop view.
+        let state = AlignmentState()
+        state.cropMode = .off
+        state.convergence = 100
+        state.resetAll()
+        #expect(state.convergence == 0)
+        #expect(state.cropMode == .off)
+    }
 }
