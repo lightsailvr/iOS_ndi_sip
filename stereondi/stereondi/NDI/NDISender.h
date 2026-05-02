@@ -41,6 +41,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// `frameRateNumerator` / `frameRateDenominator` set the advertised
 /// rate, e.g. 60000/1000 for 60p, 60000/1001 for 59.94p.
 ///
+/// Each frame carries an explicit `<ndi_color_info color_format="BT.709"
+/// color_range="limited" />` per-frame metadata XML string declaring the
+/// colorimetry. UYVY 4:2:2 progressive is BT.709 limited by NDI
+/// convention, but the explicit declaration removes any ambiguity for
+/// receivers that read per-frame metadata.
+///
 /// `NDIlib_send_send_video_v2` is documented to copy the frame into
 /// the SDK's internal queue before returning, so the caller is free
 /// to recycle `uyvyData` after this call returns.
