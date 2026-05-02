@@ -41,6 +41,14 @@ import Testing
 @MainActor
 struct StereoCompositorGoldenTests {
 
+    /// Per-test `AlignmentState` over a fresh UserDefaults suite so the
+    /// slice-#11 SessionStore write-through can't pollute the standard
+    /// suite during a Metal golden-image run.
+    private static func freshAlignment() -> AlignmentState {
+        let suite = UserDefaults(suiteName: "stereondi.tests.\(UUID().uuidString)")!
+        return AlignmentState(store: SessionStore(defaults: suite))
+    }
+
     @Test
     func zeroHitSbSGradientPair() throws {
         try renderAndCompare(named: "sbs_zero_hit_gradient", convergence: 0)
@@ -138,7 +146,7 @@ struct StereoCompositorGoldenTests {
         let leftFrame = StubVideoFrame(pixelBuffer: leftPB)
         let rightFrame = StubVideoFrame(pixelBuffer: rightPB)
 
-        let alignment = AlignmentState()
+        let alignment = Self.freshAlignment()
         alignment.convergence = convergence
         alignment.cropMode = cropMode
         alignment.screenMode = screenMode
@@ -165,7 +173,7 @@ struct StereoCompositorGoldenTests {
         let queue = try MetalRenderUtilities.makeCommandQueue(device: device)
         let target = try MetalRenderUtilities.makeRenderTarget(device: device)
 
-        let alignment = AlignmentState()
+        let alignment = Self.freshAlignment()
         alignment.screenMode = .channelTest
 
         let compositor = try StereoCompositor(device: device)
