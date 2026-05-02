@@ -22,6 +22,29 @@ static os_log_t senderLog(void) {
     return log;
 }
 
+#pragma mark - Color metadata
+
+// The NDI SDK exposes color metadata only via the per-frame
+// `p_metadata` XML string — `NDIlib_video_frame_v2_t` itself carries
+// no dedicated colorimetry field. UYVY 4:2:2 progressive is BT.709
+// limited by NDI convention (the SDK assumes this on both the send
+// and recv sides for the Standard SDK), so the XML tag below is a
+// defensive *explicit* declaration: receivers that read the metadata
+// see exactly what we intend, and receivers that ignore it still get
+// the right answer from the implicit UYVY default.
+//
+// The double-attribute form (`color_format` + `color_range`) is the
+// shape used by the public NDI tools' metadata stream; if a future
+// SDK version specifies a canonical tag in `Processing.NDI.utilities.h`
+// we should switch to that. For Standard SDK 5.x there is no such
+// canonical tag in the headers — confirmed by ripgrep over
+// Vendor/include/.
+//
+// String literal storage means the C-string lifetime is the program's
+// lifetime, which trivially outlives the synchronous send call.
+static const char *const kColorMetadataBT709Limited =
+    "<ndi_color_info color_format=\"BT.709\" color_range=\"limited\" />";
+
 #pragma mark - NDISender
 
 @implementation NDISender {
@@ -188,7 +211,11 @@ static os_log_t senderLog(void) {
     v.timecode = NDIlib_send_timecode_synthesize;
     v.p_data = (uint8_t *)uyvyData.bytes;
     v.line_stride_in_bytes = (int)stride;
-    v.p_metadata = NULL;
+    // Explicit BT.709 limited declaration — UYVY 4:2:2 progressive is
+    // BT.709 limited by NDI convention, but we declare it explicitly
+    // so receivers reading the per-frame metadata don't have to rely
+    // on the implicit default (per slice #10 issue AC).
+    v.p_metadata = kColorMetadataBT709Limited;
     v.timestamp = NDIlib_recv_timestamp_undefined;
 
     // Serialize sends so a stop() racing with a send doesn't free `_send`
