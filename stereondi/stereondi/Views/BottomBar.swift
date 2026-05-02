@@ -13,10 +13,9 @@
 //  the main row; the disclosure's per-eye readouts also display at
 //  integer precision for symmetry.
 //
-//  Slice #8 adds a temporary #if DEBUG menu (ladybug icon) carrying
-//  the screen-mode picker and swap-eyes toggle so QA can verify the
-//  new shaders before slice #9 wires up the proper UI. Removing the
-//  #if DEBUG block in slice #9 leaves the rest of the bar unchanged.
+//  Slice #9 moved the screen-mode picker and swap-eyes toggle into the
+//  TopBar (segmented control + anaglyph-only overflow menu); the
+//  slice-#8 debug menu that lived here is no longer needed.
 
 import SwiftUI
 
@@ -81,32 +80,8 @@ struct BottomBar: View {
             }
             .buttonStyle(.bordered)
             .accessibilityLabel("Per-eye fine HIT")
-
-            #if DEBUG
-            debugMenu
-            #endif
         }
     }
-
-    #if DEBUG
-    /// Temporary slice-#8 debug affordance so QA can flip the screen
-    /// mode and swap-eyes without waiting for slice #9 to wire up the
-    /// proper TopBar segmented control + overflow menu. Slice #9
-    /// removes this menu cleanly — no other code depends on it.
-    private var debugMenu: some View {
-        Menu {
-            Picker("Screen mode (debug)", selection: $alignment.screenMode) {
-                ForEach(ScreenMode.allCases, id: \.self) { mode in
-                    Text(mode.rawValue.capitalized).tag(mode)
-                }
-            }
-            Toggle("Swap eyes (debug)", isOn: $alignment.swapEyes)
-        } label: {
-            Image(systemName: "ladybug")
-        }
-        .accessibilityLabel("Debug screen mode menu")
-    }
-    #endif
 
     private var convergenceReadout: String {
         let rounded = Int(alignment.convergence.rounded())
