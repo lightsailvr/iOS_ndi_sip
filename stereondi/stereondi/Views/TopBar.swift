@@ -19,12 +19,15 @@
 //  the config's effective values feed the SenderPipeline so a rename
 //  hits the wire within one pairer tick.
 //
-//  The overflow menu is only mounted when `screenMode == .anaglyph` so
-//  the swap-eyes toggle is hidden in modes where it has no effect (this
-//  matches the AlignmentState contract: swapEyes is a no-op outside
-//  anaglyph). When not in anaglyph, the bar collapses cleanly: the
-//  segmented control sits between the source pickers (with a flexible
-//  spacer on each side) and the gear.
+//  Slice #11: source-picker presentation moves up to ContentView so
+//  the silent-auto-reconnect timeout can also present the picker
+//  through the same sheet (iOS only allows one sheet per ancestor).
+//  TopBar drives the lifted `pickerSide` binding; the sheet itself is
+//  attached in ContentView.
+//
+//  Slice #11: Settings sheet now also takes `AlignmentState` and a
+//  `SessionStore` reference so the new "Reset session" action and
+//  "Default mode on launch" picker have somewhere to write.
 //
 //  Auto-hide-after-3s behavior is intentionally deferred to slice #13;
 //  this bar is always visible.
@@ -37,7 +40,8 @@ struct TopBar: View {
     @Bindable var output: OutputStreamConfig
     var discovered: DiscoveredSources
 
-    @State private var presentingPickerForSide: SourcePickerSheet.Side?
+    @Binding var pickerSide: SourcePickerSheet.Side?
+
     @State private var settingsPresented: Bool = false
 
     var body: some View {
@@ -82,15 +86,10 @@ struct TopBar: View {
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .padding(.horizontal, 12)
         .padding(.top, 8)
-        .sheet(item: $presentingPickerForSide) { side in
-            SourcePickerSheet(
-                side: side,
-                selection: binding(for: side),
-                discovered: discovered
-            )
-        }
         .sheet(isPresented: $settingsPresented) {
-            SettingsSheet(output: output)
+            SettingsSheet(output: output,
+                          alignment: alignment,
+                          store: SessionStore.shared)
         }
     }
 
@@ -132,7 +131,7 @@ struct TopBar: View {
 
     private func sourceButton(side: SourcePickerSheet.Side, source: NDISource?) -> some View {
         Button {
-            presentingPickerForSide = side
+            pickerSide = side
         } label: {
             HStack(spacing: 6) {
                 Text(source?.name ?? "Pick \(side.label)")
@@ -147,21 +146,6 @@ struct TopBar: View {
         }
         .buttonStyle(.bordered)
         .accessibilityLabel("Pick \(side.label) source")
-    }
-
-    private func binding(for side: SourcePickerSheet.Side) -> Binding<NDISource?> {
-        switch side {
-        case .left:
-            return Binding(
-                get: { selection.leftSource },
-                set: { selection.leftSource = $0 }
-            )
-        case .right:
-            return Binding(
-                get: { selection.rightSource },
-                set: { selection.rightSource = $0 }
-            )
-        }
     }
 }
 

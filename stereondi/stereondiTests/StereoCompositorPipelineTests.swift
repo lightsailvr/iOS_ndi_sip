@@ -30,6 +30,14 @@ import Testing
 @MainActor
 struct StereoCompositorPipelineTests {
 
+    /// Per-test `AlignmentState` over a fresh UserDefaults suite so the
+    /// slice-#11 SessionStore write-through can't pollute the standard
+    /// suite during a Metal test run.
+    private static func freshAlignment() -> AlignmentState {
+        let suite = UserDefaults(suiteName: "stereondi.tests.\(UUID().uuidString)")!
+        return AlignmentState(store: SessionStore(defaults: suite))
+    }
+
     /// In `screenMode == .anaglyph`, `renderForSender(...)` ignores
     /// the screen mode and produces SbS. We assert this by sampling
     /// representative pixels in the sender output: a pixel near the
@@ -55,7 +63,7 @@ struct StereoCompositorPipelineTests {
                                    right: StubVideoFrame(pixelBuffer: rightPB),
                                    hostTime: 0)
 
-        let alignment = AlignmentState()
+        let alignment = Self.freshAlignment()
         alignment.screenMode = .anaglyph
 
         let compositor = try StereoCompositor(device: device)
@@ -139,7 +147,7 @@ struct StereoCompositorPipelineTests {
                                    right: StubVideoFrame(pixelBuffer: rightPB),
                                    hostTime: 0)
 
-        let alignment = AlignmentState()
+        let alignment = Self.freshAlignment()
         alignment.screenMode = .anaglyph
 
         let compositor = try StereoCompositor(device: device)
