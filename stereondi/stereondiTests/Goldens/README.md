@@ -29,12 +29,21 @@ then exits the test as a pass without comparing.
 
 ## First-run on a fresh checkout
 
-Slice #4 ships the test scaffolding without the actual reference PNG
-because the agent that wrote slice #4 ran on Linux where Metal isn't
-available. The first developer who runs the tests on a Mac will see
-`GoldenImageError.missingReference("sbs_zero_hit_gradient")`. The fix
-is to run the test once with `STEREONDI_UPDATE_GOLDENS=1` to seed the
-reference PNG, then re-run normally to confirm the comparison passes.
+Slice #4 shipped the test scaffolding without the reference PNGs
+because the agents writing slices #4 and #6 ran on Linux where Metal
+isn't available. The first developer who runs the tests on a Mac will
+see `GoldenImageError.missingReference(...)` for any unseeded golden.
+The fix is to run the tests once with `STEREONDI_UPDATE_GOLDENS=1` to
+seed the reference PNGs, then re-run normally to confirm the
+comparisons pass.
+
+Goldens currently expected (slice #4 + slice #6):
+
+- `sbs_zero_hit_gradient.png` — convergence 0 (slice #4 baseline)
+- `sbs_hit_p50.png`  — convergence +50
+- `sbs_hit_n50.png`  — convergence −50
+- `sbs_hit_p200.png` — convergence +200
+- `sbs_hit_p0_3.png` — convergence +0.3 (sub-pixel)
 
 ## File-system-synchronized test target
 
